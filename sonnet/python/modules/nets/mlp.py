@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """A minimal interface mlp module."""
 from __future__ import absolute_import
 from __future__ import division
@@ -19,11 +20,13 @@ from __future__ import print_function
 
 import collections
 
+from six.moves import xrange  # pylint: disable=redefined-builtin
 from sonnet.python.modules import base
 from sonnet.python.modules import basic
 from sonnet.python.modules import util
 
 import tensorflow as tf
+from tensorflow.python.layers import utils
 
 
 class MLP(base.AbstractModule, base.Transposable):
@@ -37,6 +40,8 @@ class MLP(base.AbstractModule, base.Transposable):
                partitioners=None,
                regularizers=None,
                use_bias=True,
+               use_dropout=False,
+               custom_getter=None,
                name="mlp"):
     """Constructs an MLP module.
 
@@ -62,6 +67,12 @@ class MLP(base.AbstractModule, base.Transposable):
         the L1 and L2 regularizers in `tf.contrib.layers`.
       use_bias: Whether to include bias parameters in the linear layers.
         Default `True`.
+      use_dropout: Whether to perform dropout on the linear layers.
+        Default `False`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -71,7 +82,7 @@ class MLP(base.AbstractModule, base.Transposable):
       TypeError: If `activation` is not callable; or if `output_sizes` is not
         iterable.
     """
-    super(MLP, self).__init__(name=name)
+    super(MLP, self).__init__(custom_getter=custom_getter, name=name)
 
     if not isinstance(output_sizes, collections.Iterable):
       raise TypeError("output_sizes must be iterable")
@@ -95,6 +106,7 @@ class MLP(base.AbstractModule, base.Transposable):
     self._activate_final = activate_final
 
     self._use_bias = use_bias
+    self._use_dropout = use_dropout
     self._instantiate_layers()
 
   def _instantiate_layers(self):
@@ -111,7 +123,13 @@ class MLP(base.AbstractModule, base.Transposable):
     connected to the graph.
     """
 
-    with self._enter_variable_scope():
+    # Here we are entering the module's variable scope to name our submodules
+    # correctly (not to create variables). As such it's safe to not check
+    # whether we're in the same graph. This is important if we're constructing
+    # the module in one graph and connecting it in another (e.g. with `defun`
+    # the module is created in some default graph, and connected to a capturing
+    # graph in order to turn it into a graph function).
+    with self._enter_variable_scope(check_same_graph=False):
       self._layers = [basic.Linear(self._output_sizes[i],
                                    name="linear_{}".format(i),
                                    initializers=self._initializers,
@@ -124,12 +142,15 @@ class MLP(base.AbstractModule, base.Transposable):
   def get_possible_initializer_keys(cls, use_bias=True):
     return basic.Linear.get_possible_initializer_keys(use_bias=use_bias)
 
-  def _build(self, inputs):
+  def _build(self, inputs, is_training=True, dropout_keep_prob=0.5):
     """Assembles the `MLP` and connects it to the graph.
 
     Args:
       inputs: A 2D Tensor of size `[batch_size, input_size]`.
-
+      is_training: A bool or tf.Bool Tensor. Indicates whether we are
+        currently training. Defaults to `True`.
+      dropout_keep_prob: The probability that each element is kept when
+        both `use_dropout` and `is_training` are True. Defaults to 0.5.
     Returns:
       A 2D Tensor of size `[batch_size, output_sizes[-1]]`.
     """
@@ -141,6 +162,13 @@ class MLP(base.AbstractModule, base.Transposable):
       net = self._layers[layer_id](net)
 
       if final_index != layer_id or self._activate_final:
+        # Only perform dropout whenever we are activating the layer's outputs.
+        if self._use_dropout:
+          keep_prob = utils.smart_cond(
+              is_training, true_fn=lambda: dropout_keep_prob,
+              false_fn=lambda: tf.constant(1.0)
+          )
+          net = tf.nn.dropout(net, keep_prob=keep_prob)
         net = self._activation(net)
 
     return net
@@ -152,11 +180,28 @@ class MLP(base.AbstractModule, base.Transposable):
 
   @property
   def output_sizes(self):
+    """Returns a tuple of all output sizes of all the layers."""
     return tuple([l() if callable(l) else l for l in self._output_sizes])
+
+  @property
+  def output_size(self):
+    """Returns the size of the module output, not including the batch dimension.
+
+    This allows the MLP to be used inside a DeepRNN.
+
+    Returns:
+      The scalar size of the module output.
+    """
+    last_size = self._output_sizes[-1]
+    return last_size() if callable(last_size) else last_size
 
   @property
   def use_bias(self):
     return self._use_bias
+
+  @property
+  def use_dropout(self):
+    return self._use_dropout
 
   @property
   def initializers(self):
@@ -193,7 +238,7 @@ class MLP(base.AbstractModule, base.Transposable):
     """Returns transposed `MLP`.
 
     Args:
-      name: Optional string specifiying the name of the transposed module. The
+      name: Optional string specifying the name of the transposed module. The
         default name is constructed by appending "_transpose"
         to `self.module_name`.
       activate_final: Optional boolean determining if the activation and batch
@@ -208,11 +253,37 @@ class MLP(base.AbstractModule, base.Transposable):
       activate_final = self.activate_final
     output_sizes = [lambda l=layer: l.input_shape[1] for layer in self._layers]
     output_sizes.reverse()
-    return MLP(name=name,
-               output_sizes=output_sizes,
-               activation=self.activation,
-               activate_final=activate_final,
-               initializers=self.initializers,
-               partitioners=self.partitioners,
-               regularizers=self.regularizers,
-               use_bias=self.use_bias)
+    return MLP(
+        name=name,
+        output_sizes=output_sizes,
+        activation=self.activation,
+        activate_final=activate_final,
+        initializers=self.initializers,
+        partitioners=self.partitioners,
+        regularizers=self.regularizers,
+        use_bias=self.use_bias,
+        use_dropout=self.use_dropout)
+
+  def clone(self, name=None):
+    """Creates a new MLP with the same structure.
+
+    Args:
+      name: Optional string specifying the name of the new module. The default
+        name is constructed by appending "_clone" to the original name.
+
+    Returns:
+      A cloned `MLP` module.
+    """
+
+    if name is None:
+      name = self.module_name + "_clone"
+    return MLP(
+        name=name,
+        output_sizes=self.output_sizes,
+        activation=self.activation,
+        activate_final=self.activate_final,
+        initializers=self.initializers,
+        partitioners=self.partitioners,
+        regularizers=self.regularizers,
+        use_bias=self.use_bias,
+        use_dropout=self.use_dropout)

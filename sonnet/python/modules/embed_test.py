@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Tests for sonnet.python.modules.embed."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# Dependency imports
 
+from absl.testing import parameterized
 import numpy as np
 import sonnet as snt
 import tensorflow as tf
@@ -26,7 +29,7 @@ import tensorflow as tf
 from tensorflow.python.ops import variables
 
 
-class EmbedTest(tf.test.TestCase):
+class EmbedTest(parameterized.TestCase, tf.test.TestCase):
 
   def setUp(self):
     super(EmbedTest, self).setUp()
@@ -35,6 +38,9 @@ class EmbedTest(tf.test.TestCase):
     self._embed_dim = 1
     self._embed_mod = snt.Embed(
         vocab_size=self._vocab_size, embed_dim=self._embed_dim)
+    self._embed_mod_dense = snt.Embed(
+        vocab_size=self._vocab_size, embed_dim=self._embed_dim,
+        densify_gradients=True)
     self._ids = np.asarray([[0, 1, 2, 3, 4], [1, 2, 3, 4, 5], [2, 3, 4, 5, 6]])
 
   def testOutputType(self):
@@ -45,9 +51,17 @@ class EmbedTest(tf.test.TestCase):
     self.assertTrue(embeddings.get_shape().is_compatible_with(expected_shape))
     self.assertEqual(embeddings.dtype, tf.float32)
 
-  def testComputation(self):
+  @parameterized.named_parameters(
+      ("Index-Slices", False),
+      ("Dense Tensor", True),
+  )
+  def testComputation(self, densify_gradients):
     # Initialize each embedding to its index. Thus, the lookup ids are the same
     # as the embeddings themselves.
+    if densify_gradients:
+      embed_mod = self._embed_mod_dense
+    else:
+      embed_mod = self._embed_mod
     initializers = {"embeddings": tf.constant_initializer(
         [[0], [1], [2], [3], [4], [5], [6]], dtype=tf.float32)}
     embed_mod = snt.Embed(
@@ -96,6 +110,8 @@ class EmbedTest(tf.test.TestCase):
   def testInitializers(self):
     # Since all embeddings are initialized to zero, the extracted embeddings
     # should be as well.
+
+
     initializers = {"embeddings": tf.zeros_initializer()}
     embed_mod = snt.Embed(
         vocab_size=self._vocab_size,
@@ -158,7 +174,7 @@ class EmbedTest(tf.test.TestCase):
     with self.assertRaises(snt.NotConnectedError):
       _ = self._embed_mod.embeddings
     self._embed_mod(tf.convert_to_tensor(self._ids))
-    self.assertEqual(type(self._embed_mod.embeddings), tf.Variable)
+    self.assertIsInstance(self._embed_mod.embeddings, tf.Variable)
 
   def testExistingVocab(self):
     # Check that the module can be initialised with an existing vocabulary.

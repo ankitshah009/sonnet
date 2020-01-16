@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Base class for TensorFlow Sonnet recurrent cores.
 
 This file contains the Abstract Base Class for defining Recurrent Cores in
@@ -25,12 +26,19 @@ from __future__ import print_function
 import abc
 import warnings
 
+# Dependency imports
+
 import six
+from six.moves import xrange  # pylint: disable=redefined-builtin
 from sonnet.python.modules import base
 from sonnet.python.modules import basic
-
 import tensorflow as tf
-from tensorflow.python.util import nest
+import wrapt
+
+# pylint: disable=g-direct-tensorflow-import
+from tensorflow.python.ops import rnn_cell_impl
+# pylint: enable=g-direct-tensorflow-import
+nest = tf.contrib.framework.nest
 
 
 def _single_learnable_state(state, state_id=0, learnable=True):
@@ -160,32 +168,31 @@ def trainable_initial_state(batch_size, state_size, dtype, initializers=None,
 
 
 @six.add_metaclass(abc.ABCMeta)
-class RNNCore(base.AbstractModule, tf.contrib.rnn.RNNCell):
+class RNNCore(base.AbstractModule):
   """Superclass for Recurrent Neural Network Cores.
 
   This class defines the basic functionality that every core should implement,
   mainly the `initial_state` method which will return an example of their
   initial state.
-  It also inherits from the two interfaces it should be compatible with, which
-  are `snt.Module` and `tf.contrib.rnn.RNNCell`.
+  It also inherits from the interface `snt.AbstractModule`.
 
   As with any other `snt.Module` any subclass must implement a `_build` method
   that constructs the graph that corresponds to a core. Such a `_build` method
   should always have the same interface, which is the following:
 
-      output, new_state = self._build(input, prev_state)
+      output, next_state = self._build(input, prev_state)
 
-  where output, new_state, input, and prev_state are arbitrarily nested
+  where output, next_state, input, and prev_state are arbitrarily nested
   tensors. Such structures can be defined according to the following
   grammar:
 
       element = tuple(element*) | list(element*) | tf.Tensor
 
   This class is to be used with tensorflow containers such as `rnn` in
-  tensorflow.python.ops.rnn. These containers only accept
-  `tf.contrib.rnn.RNNCell` objects, hence the need to comply with its interface.
-  This way, all the RNNCores should expose a `state_size` and `output_size`
-  properties.
+  tensorflow.python.ops.rnn.
+  These containers only accept inputs which are compatible with the
+  `tf.contrib.rnn.RNNCell` API, so that all the RNNCores should expose
+  `state_size` and `output_size` properties.
   """
   __metaclass__ = abc.ABCMeta
 
@@ -235,6 +242,40 @@ class RNNCore(base.AbstractModule, tf.contrib.rnn.RNNCell):
             regularizers=trainable_regularizers,
             name=self._initial_state_scope(name))
 
+  @property
+  def state_size(self):
+    """size(s) of state(s) used by this cell.
+
+    It can be represented by an Integer, a TensorShape or a tuple of Integers
+    or TensorShapes.
+    """
+    raise NotImplementedError("Abstract method")
+
+  @property
+  def output_size(self):
+    """Integer or TensorShape: size of outputs produced by this cell."""
+    raise NotImplementedError("Abstract method")
+
+  def zero_state(self, batch_size, dtype):
+    """Return zero-filled state tensor(s).
+
+    Args:
+      batch_size: int, float, or unit Tensor representing the batch size.
+      dtype: the data type to use for the state.
+
+    Returns:
+      If `state_size` is an int or TensorShape, then the return value is a
+      `N-D` tensor of shape `[batch_size x state_size]` filled with zeros.
+
+      If `state_size` is a nested list or tuple, then the return value is
+      a nested list or tuple (of the same structure) of `2-D` tensors with
+      the shapes `[batch_size x s]` for each s in `state_size`.
+    """
+    # Keep scope for backwards compatibility.
+    with tf.name_scope(type(self).__name__ + "ZeroState", values=[batch_size]):
+      return rnn_cell_impl._zero_state_tensors(  # pylint: disable=protected-access
+          self.state_size, batch_size, dtype)
+
 
 class TrainableInitialState(base.AbstractModule):
   """Helper Module that creates a learnable initial state for an RNNCore.
@@ -257,7 +298,7 @@ class TrainableInitialState(base.AbstractModule):
   def __init__(self, initial_state, mask=None, name="trainable_initial_state"):
     """Constructs the Module that introduces a trainable state in the graph.
 
-    It receives an initial state that will be used as the intial values for the
+    It receives an initial state that will be used as the initial values for the
     trainable variables that the module contains, and optionally a mask that
     indicates the parts of the initial state that should be learnable.
 
@@ -306,3 +347,61 @@ class TrainableInitialState(base.AbstractModule):
 
     return nest.pack_sequence_as(structure=self._initial_state,
                                  flat_sequence=flat_learnable_state)
+
+
+class RNNCellWrapper(RNNCore):
+  """RNN core that delegates to a `tf.contrib.rnn.RNNCell`."""
+
+  def __init__(self, cell_ctor, *args, **kwargs):
+    """Constructs the cell, within this module's variable scope.
+
+    Args:
+      cell_ctor: Callable that instantiates a `tf.contrib.rnn.RNNCell`.
+      *args: Arguments to pass to `cell_ctor`.
+      **kwargs: Keyword arguments to pass to `cell_ctor`.
+        If `name` is provided, it is passed to `RNNCore.__init__` as well.
+        If `custom_getter` is provided, it is passed to `RNNCore.__init__`
+        but not to `cell_ctor`.
+    """
+    super(RNNCellWrapper, self).__init__(
+        name=kwargs.get("name"),
+        custom_getter=kwargs.pop("custom_getter", None))
+
+    with self._enter_variable_scope():
+      self._cell = cell_ctor(*args, **kwargs)
+
+  def _build(self, inputs, prev_state):
+    return self._cell(inputs, prev_state)
+
+  @property
+  def output_size(self):
+    return self._cell.output_size
+
+  @property
+  def state_size(self):
+    return self._cell.state_size
+
+
+def with_doc(fn_with_doc_to_copy):
+  """Returns a decorator to copy documentation from the given function.
+
+  Docstring is copied, including *args and **kwargs documentation.
+
+  Args:
+    fn_with_doc_to_copy: Function whose docstring, including *args and
+      **kwargs documentation, is to be copied.
+
+  Returns:
+    Decorated version of `wrapper_init` with documentation copied from
+    `fn_with_doc_to_copy`.
+  """
+
+  def decorator(wrapper_init):
+    # Wrap the target class's constructor (to assume its docstring),
+    # but invoke the wrapper class's constructor.
+    @wrapt.decorator
+    def wrapping_fn(unused_wrapped, instance, args, kwargs):
+      wrapper_init(instance, *args, **kwargs)
+    return wrapping_fn(fn_with_doc_to_copy)  # pylint: disable=no-value-for-parameter
+
+  return decorator

@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Basic Modules for TensorFlow snt.
 
 Modules defining the simplest building blocks for Neural Networks.
@@ -23,26 +24,48 @@ from __future__ import print_function
 import math
 import numbers
 
+# Dependency imports
 
 import numpy as np
+from six.moves import xrange  # pylint: disable=redefined-builtin
 from sonnet.python.modules import base
 from sonnet.python.modules import util
-from sonnet.python.ops import nest
 import tensorflow as tf
 
+nest = tf.contrib.framework.nest
 
-def merge_leading_dims(tensor, n_dims=2):
+
+def merge_leading_dims(array_or_tensor, n_dims=2):
   """Merge the first dimensions of a tensor.
 
   Args:
-    tensor: Tensor to have its first dimensions merged.
+    array_or_tensor: Tensor to have its first dimensions merged. Can also
+        be an array or numerical value, which will be converted to a tensor
+        for batch application, if needed.
     n_dims: Number of dimensions to merge.
 
   Returns:
-    The input tensor, with its first dimensions merged.
+    Either the input value converted to a Tensor, with the requested dimensions
+    merged, or the unmodified input value if the input has less than `n_dims`
+    dimensions.
+
+  Raises:
+    ValueError: If the rank of `array_or_tensor` is not well-defined.
   """
+  tensor = tf.convert_to_tensor(array_or_tensor)
   tensor_shape_static = tensor.get_shape()
+
+  # Check if the rank of the input tensor is well-defined.
+  if tensor_shape_static.dims is None:
+    raise ValueError("Can't merge leading dimensions of tensor of unknown "
+                     "rank.")
   tensor_shape_list = tensor_shape_static.as_list()
+
+  # We can only merge the n_dims leading dimensions if the rank of the given
+  # tensor is sufficiently large.
+  if n_dims > len(tensor_shape_list):
+    return array_or_tensor
+
   if tensor_shape_static.is_fully_defined():
     new_shape = (
         [np.prod(tensor_shape_list[:n_dims])] + tensor_shape_list[n_dims:])
@@ -51,14 +74,18 @@ def merge_leading_dims(tensor, n_dims=2):
 
   # Shape can't be inferred statically.
   tensor_shape = tf.shape(tensor)
-  new_first_dim = tf.reduce_prod(tensor_shape[:n_dims], keep_dims=True)
+  new_first_dim = tf.reduce_prod(tensor_shape[:n_dims], keepdims=True)
   other_dims = tensor_shape[n_dims:]
   new_size = tf.concat([new_first_dim, other_dims], 0)
   result = tf.reshape(tensor, new_size)
 
+  if all(value is not None for value in tensor_shape_list[:n_dims]):
+    merged_leading_size = np.prod(tensor_shape_list[:n_dims])
+  else:
+    merged_leading_size = None
   # We need to set the result size of this, as otherwise we won't be able to
-  # pass to e.g. a Linear.
-  result.set_shape([None] + tensor_shape_list[n_dims:])
+  # pass to e.g. a Linear. Here we need to know at least the rank of the tensor.
+  result.set_shape([merged_leading_size] + tensor_shape_list[n_dims:])
   return result
 
 
@@ -93,15 +120,15 @@ def split_leading_dim(tensor, inputs, n_dims=2):
   return result
 
 
-def create_linear_initializer(input_size):
+def create_linear_initializer(input_size, dtype=tf.float32):
   """Returns a default initializer for weights of a linear module."""
   stddev = 1 / math.sqrt(input_size)
-  return tf.truncated_normal_initializer(stddev=stddev)
+  return tf.truncated_normal_initializer(stddev=stddev, dtype=dtype)
 
 
-def create_bias_initializer(unused_bias_shape):
+def create_bias_initializer(unused_bias_shape, dtype=tf.float32):
   """Returns a default initializer for the biases of a linear/AddBias module."""
-  return tf.zeros_initializer()
+  return tf.zeros_initializer(dtype=dtype)
 
 
 class Linear(base.AbstractModule, base.Transposable):
@@ -113,6 +140,7 @@ class Linear(base.AbstractModule, base.Transposable):
                initializers=None,
                partitioners=None,
                regularizers=None,
+               custom_getter=None,
                name="linear"):
     """Constructs a Linear module.
 
@@ -136,17 +164,19 @@ class Linear(base.AbstractModule, base.Transposable):
         regularizers are used. A regularizer should be a function that takes
         a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
         the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
-      KeyError: If `initializers` contains any keys other than 'w' or 'b'.
-      KeyError: If `partitioners` contains any keys other than 'w' or 'b'.
-      KeyError: If `regularizers` contains any keys other than 'w' or 'b'.
-      TypeError: If any of the given initializers are not callable.
-      TypeError: If any of the given partitioners are not callable.
-      TypeError: If any of the given regularizers are not callable.
+      KeyError: If `initializers`, `partitioners` or `regularizers` contains any
+        keys other than 'w' or 'b'.
+      TypeError: If any of the given initializers, partitioners or regularizers
+        are not callable.
     """
-    super(Linear, self).__init__(name=name)
+    super(Linear, self).__init__(custom_getter=custom_getter, name=name)
     self._output_size = output_size
     self._use_bias = use_bias
     self._input_shape = None
@@ -203,15 +233,17 @@ class Linear(base.AbstractModule, base.Transposable):
           .format(self.scope_name, self._input_shape[1], input_shape[1]))
 
     self._input_shape = input_shape
+    dtype = inputs.dtype
 
     if "w" not in self._initializers:
-      self._initializers["w"] = create_linear_initializer(self._input_shape[1])
+      self._initializers["w"] = create_linear_initializer(self._input_shape[1],
+                                                          dtype)
 
     if "b" not in self._initializers and self._use_bias:
-      self._initializers["b"] = create_bias_initializer(self._input_shape[1])
+      self._initializers["b"] = create_bias_initializer(self._input_shape[1],
+                                                        dtype)
 
     weight_shape = (self._input_shape[1], self.output_size)
-    dtype = inputs.dtype
     self._w = tf.get_variable("w",
                               shape=weight_shape,
                               dtype=dtype,
@@ -276,6 +308,40 @@ class Linear(base.AbstractModule, base.Transposable):
     """Returns `True` if bias Variable is present in the module."""
     return self._use_bias
 
+  @property
+  def initializers(self):
+    """Returns the initializers dictionary."""
+    return self._initializers
+
+  @property
+  def partitioners(self):
+    """Returns the partitioners dictionary."""
+    return self._partitioners
+
+  @property
+  def regularizers(self):
+    """Returns the regularizers dictionary."""
+    return self._regularizers
+
+  def clone(self, name=None):
+    """Returns a cloned `Linear` module.
+
+    Args:
+      name: Optional string assigning name of cloned module. The default name
+          is constructed by appending "_clone" to `self.module_name`.
+
+    Returns:
+      Cloned `Linear` module.
+    """
+    if name is None:
+      name = self.module_name + "_clone"
+    return Linear(output_size=self.output_size,
+                  use_bias=self._use_bias,
+                  initializers=self._initializers,
+                  partitioners=self._partitioners,
+                  regularizers=self._regularizers,
+                  name=name)
+
   # Implements Transposable interface.
   @property
   def input_shape(self):
@@ -299,8 +365,100 @@ class Linear(base.AbstractModule, base.Transposable):
     return Linear(output_size=lambda: self.input_shape[1],
                   use_bias=self._use_bias,
                   initializers=self._initializers,
+                  partitioners=self._partitioners,
                   regularizers=self._regularizers,
                   name=name)
+
+
+class ConcatLinear(base.AbstractModule):
+  """Linear transformation of a number of concatenated inputs.
+
+  This class ensures that at initialisation, the relative importance of all
+  inputs are similar even if they have very different sizes. This assumes
+  that all inputs have roughly the same range of values.
+
+  For example, the following code also concatenates a list of inputs and applies
+  a linear transform:
+  ```
+  inp = tf.concat(input_list, axis=-1)
+  return snt.Linear(output_size)(inp)
+  ```
+  The issue with the above code is that if `input_list` is made of two Tensors
+  of very different shapes such as `[batch_size, 1]` and `[batch_size, 128]`,
+  then almost no signal will be received from the first Tensor. This class works
+  around this problem by using a weight matrix with relatively larger
+  coefficients for the first Tensor than for the second one.
+  """
+
+  def __init__(self,
+               output_size,
+               use_bias=True,
+               initializers=None,
+               partitioners=None,
+               regularizers=None,
+               custom_getter=None,
+               name="concat_linear"):
+    """Constructs a ConcatLinear module.
+
+    Args:
+      output_size: Output dimensionality. `output_size` can be either an integer
+          or a callable. In the latter case, since the function invocation is
+          deferred to graph construction time, the user must only ensure that
+          output_size can be called, returning an integer, when build is called.
+      use_bias: Whether to include bias parameters. Default `True`.
+      initializers: Optional dict containing initializers to initialize the
+          weights (with key 'w') or biases (with key 'b'). The default
+          initializer for the weights is a truncated normal initializer, which
+          is commonly used when the inputs are zero centered (see
+          https://arxiv.org/pdf/1502.03167v3.pdf). The default initializer for
+          the bias is a zero initializer.
+      partitioners: Optional dict containing partitioners to partition
+          weights (with key 'w') or biases (with key 'b'). As a default, no
+          partitioners are used.
+      regularizers: Optional dict containing regularizers for the weights
+        (with key 'w') and the biases (with key 'b'). As a default, no
+        regularizers are used. A regularizer should be a function that takes
+        a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
+        the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
+      name: Name of the module.
+    """
+    super(ConcatLinear, self).__init__(name=name, custom_getter=custom_getter)
+    self._output_size = output_size
+    self._use_bias = use_bias
+    self._initializers = initializers
+    self._partitioners = partitioners
+    self._regularizers = regularizers
+
+  def _build(self, inputs_list):
+    """Connects the module into the graph.
+
+    If this is not the first time the module has been connected to the graph,
+    the Tensors provided here must have the same final dimensions as when called
+    the first time, in order for the existing variables to be the correct size
+    for the multiplication. The batch size may differ for each connection.
+
+    Args:
+      inputs_list: A list of 2D Tensors of rank 2, with leading batch dimension.
+
+    Returns:
+      A 2D Tensor of size [batch_size, output_size].
+    """
+    outputs = []
+    for idx, tensor in enumerate(inputs_list):
+      outputs.append(
+          Linear(
+              self._output_size,
+              initializers=self._initializers,
+              partitioners=self._partitioners,
+              regularizers=self._regularizers,
+              # Since we are interpreting this as 'one big linear', we only need
+              # one bias.
+              use_bias=(idx == 0 and self._use_bias))(tensor))
+    return tf.add_n(outputs)
 
 
 def calculate_bias_shape(input_shape, bias_dims):
@@ -370,7 +528,7 @@ class AddBias(base.AbstractModule, base.Transposable):
           over (given size of 1), and leading dimensions will be removed
           completely. For example, for an input of [batch_size, dim1_size,
           dim2_size, dim3_size] and `bias_dims=[1, 3]`, the resulting
-          bias will have shape [dim1_size, 1, dim2_size]. The default is to
+          bias will have shape [dim1_size, 1, dim3_size]. The default is to
           retain all dimensions apart from the minibatch dimension. Trying to
           retain the bias shape over the minibatch dimension, e.g.
           `bias_dims=[0]`, will result in an error at build time. See the
@@ -413,6 +571,13 @@ class AddBias(base.AbstractModule, base.Transposable):
     first_bias = snt.AddBias(bias_dims=[1])
     first_bias_output = first_bias(input)
     first_bias.b.get_shape()  # (dim1_size, 1, 1)
+
+    # Subtract and later add the same learned bias:
+    bias = snt.AddBias()
+    hidden1 = bias(input, multiplier=-1)
+    # ...
+    reconstructed_input = bias(hidden4)
+
     ```
 
     Raises:
@@ -435,11 +600,16 @@ class AddBias(base.AbstractModule, base.Transposable):
     self._regularizers = util.check_regularizers(
         regularizers, self.POSSIBLE_INITIALIZER_KEYS)
 
-  def _build(self, inputs):
+  def _build(self, inputs, multiplier=1):
     """Connects the Add module into the graph, with input Tensor `inputs`.
 
     Args:
       inputs: A Tensor of size `[batch_size, input_size1, ...]`.
+      multiplier: A scalar or Tensor which the bias term is multiplied by
+        before adding it to `inputs`. Anything which works in the expression
+        `bias * multiplier` is acceptable here. This may be useful if you want
+        to add a bias in one place and subtract the same bias in another place
+        via `multiplier=-1`.
 
     Returns:
       A Tensor of size `[batch_size, input_size1, ...]`.
@@ -482,11 +652,11 @@ class AddBias(base.AbstractModule, base.Transposable):
                                                    input_shape[1]))
 
     self._input_shape = input_shape
+    dtype = inputs.dtype
 
     if "b" not in self._initializers:
-      self._initializers["b"] = create_bias_initializer(bias_shape)
+      self._initializers["b"] = create_bias_initializer(bias_shape, dtype)
 
-    dtype = inputs.dtype
     self._b = tf.get_variable(
         "b",
         shape=bias_shape,
@@ -495,7 +665,10 @@ class AddBias(base.AbstractModule, base.Transposable):
         partitioner=self._partitioners.get("b", None),
         regularizer=self._regularizers.get("b", None))
 
-    outputs = inputs + self._b
+    bias = self._b
+    if multiplier != 1:
+      bias = bias * multiplier  # pylint: disable=g-no-augmented-assignment
+    outputs = inputs + bias
     return outputs
 
   @property
@@ -543,25 +716,42 @@ class AddBias(base.AbstractModule, base.Transposable):
 class BatchReshape(base.AbstractModule, base.Transposable):
   """Reshapes input Tensor, preserving the batch dimension."""
 
-  def __init__(self, shape, name="batch_reshape"):
+  def __init__(self, shape, preserve_dims=1, name="batch_reshape"):
     """Constructs a BatchReshape module.
 
     Args:
       shape: Shape to reshape the input Tensor to while preserving its
-          batch size; `shape` can be either a tuple/list, or a callable that
-          returns the actual shape. The callable does not need to be ready to
-          return something meaningful at construction time, but it will be
-          required to be able to do so when the module is connected to the
-          graph. When the special value -1 appears in `shape` the corresponding
-          size is automatically inferred. Note that -1 can only appear once in
-          `shape`. To flatten all non-batch dimensions, the snt.BatchFlatten
-          module can also be used.
+          first `preserve_dims` dimensions; `shape` can be either a tuple/list,
+          or a callable that returns the actual shape. The callable does not
+          need to be ready to return something meaningful at construction time,
+          but it will be required to be able to do so when the module is
+          connected to the graph. When the special value -1 appears in `shape`
+          the corresponding size is automatically inferred. Note that -1 can
+          only appear once in `shape`. To flatten all non-batch dimensions,
+          the snt.BatchFlatten module can also be used.
+      preserve_dims: Number of leading dimensions that will not be reshaped.
+          For example, given an input Tensor with shape `[B, H, W, C, D]`,
+          and argument `shape` equal to `(-1, D)`:
+            * `preserve_dims=1` will return a Tensor with shape `[B, H*W*C, D]`.
+            * `preserve_dims=2` will return a Tensor with
+                shape `[B, H, W*C, D]`.
+            * `preserve_dims=3` will return a Tensor with
+                shape `[B, H, W, C, D]`.
+            * `preserve_dims=4` will return a Tensor with
+                shape `[B, H, W, C, 1, D]`.
+            * `preserve_dims>=5` will throw an error on build unless D=1.
+          The preserved dimensions can be unknown at building time.
       name: Name of the module.
+    Raises:
+      ValueError: If `preserve_dims <= 0`.
     """
     super(BatchReshape, self).__init__(name=name)
 
     self._input_shape = None
     self._shape = shape
+    self._preserve_dims = preserve_dims
+    if preserve_dims <= 0:
+      raise ValueError("Argument preserve_dims should be >= 1.")
 
     if not callable(self._shape):
       self._shape = tuple(self._shape)
@@ -590,46 +780,84 @@ class BatchReshape(base.AbstractModule, base.Transposable):
     """Connects the module into the graph, with input Tensor `inputs`.
 
     Args:
-      inputs: A Tensor of shape [batch_size] + input_shape.
+      inputs: A Tensor of shape [b_1, b_2, ..., b_preserve_dims,
+                                 b_preserve_dims+1, ...].
 
     Returns:
-      A Tensor of shape [batch_size] + output_shape, with output_shape as
-         defined in constructor.
+      A Tensor of shape [b_1, b_2, ..., b_preserve_dims,
+                         b_reshape_1, b_reshape_2, ...],
+        with reshaping defined by the constructor `shape` parameter.
 
     Raises:
       ValueError: If output shape is incompatible with input shape; or if
           shape array contains non numeric entries; or if shape array contains
-          more than 1 wildcard -1.
+          more than 1 wildcard -1; or if the input array contains unknown,
+          non-preserved dimensions (except when the unknown dimension is the
+          only non-preserved dimension and doesn't actually need reshaping).
     """
-    self._input_shape = inputs.get_shape()[1:].as_list()
+    full_input_shape = inputs.get_shape().as_list()
+    if len(full_input_shape) < self._preserve_dims:
+      raise ValueError("Input tensor has {} dimensions, should have at least "
+                       "as many as preserve_dims={}".format(
+                           len(full_input_shape),
+                           self._preserve_dims))
+    self._input_shape = full_input_shape[self._preserve_dims:]
 
     if callable(self._shape):
       self._shape = tuple(self._shape())
 
-    # Special-case 2D inputs, where no reshape is necessary. This is useful if
-    # `inputs` contains empty dimensions.
+    # Special-case of 1 non-preserved dimension, where no reshape is necessary.
+    # This is useful if the non-preserved dimension of `inputs` is unknown
+    # at build time.
     if len(self._input_shape) == 1 and len(self._shape) == 1:
       if self._shape[0] == -1 or self._shape[0] == self._input_shape[0]:
         return inputs
       else:
-        raise ValueError("Output shape is incompatible with input shape")
+        if self._input_shape[0] is None:
+          raise ValueError("Unknown non-preserved dimensions are not allowed "
+                           "in the input to BatchReshape unless it is only one "
+                           "and the desired shape is (-1,).")
+        else:
+          raise ValueError("Output shape is incompatible with input shape")
 
     if not all([isinstance(x, numbers.Integral) and (x > 0 or x == -1)
                 for x in self._shape]):
-      raise ValueError("Input array shape can contain positive integral "
-                       "numbers only, and the wildcard -1 used once")
+      raise ValueError(
+          "Desired shape can only contain positive integral numbers "
+          "and the wildcard -1. Given shape {}".format(self._shape))
 
     if self._shape.count(-1) > 1:
-      raise ValueError("Wildcard -1 can appear only once in shape")
+      raise ValueError(
+          "Wildcard -1 can appear only once in desired output shape. "
+          "Given shape {}".format(self._shape))
 
+    preserved_shape = tf.shape(inputs)[:self._preserve_dims]
+    # Slicing the shape tensor loses information, we keep it in a list.
+    preserved_shape_list = inputs.get_shape()[:self._preserve_dims]
+
+    # Except in the case above where no reshape is needed, we do not allow
+    # unknown non-preserved dimensions in the input.
+    if None in self._input_shape:
+      raise ValueError("Unknown non-preserved dimensions are not allowed in "
+                       "the input to BatchReshape unless it is only one and the"
+                       " desired shape is (-1,). The offending non-preserved "
+                       "input shape is {}".format(self._input_shape))
     if self._shape.count(-1) > 0:
-      shape = (-1,) + self._infer_shape(self._input_shape)
+      trailing_shape = self._infer_shape(self._input_shape)
     else:
-      shape = (-1,) + self._shape
+      trailing_shape = self._shape
 
-    if np.prod(self._input_shape) != np.prod(shape[1:]):
+    if np.prod(self._input_shape) != np.prod(trailing_shape):
       raise ValueError("Output shape is incompatible with input shape")
-    return tf.reshape(inputs, shape)
+
+    shape = tf.concat([preserved_shape, trailing_shape], 0)
+    output = tf.reshape(inputs, shape)
+
+    # Include shape information that was lost when we sliced the shape tensor.
+    shape_list = preserved_shape_list.concatenate(trailing_shape)
+    output.set_shape(shape_list)
+
+    return output
 
   @property
   def input_shape(self):
@@ -641,19 +869,33 @@ class BatchReshape(base.AbstractModule, base.Transposable):
     """Returns transpose batch reshape."""
     if name is None:
       name = self.module_name + "_transpose"
-    return BatchReshape(shape=lambda: self.input_shape, name=name)
+    return BatchReshape(shape=lambda: self.input_shape,
+                        preserve_dims=self._preserve_dims,
+                        name=name)
 
 
 class BatchFlatten(BatchReshape):
-  """Flattens the input Tensor, preserving the batch dimension."""
+  """Flattens the input Tensor, preserving the batch dimension(s)."""
 
-  def __init__(self, name="batch_flatten"):
+  def __init__(self, preserve_dims=1, name="batch_flatten"):
     """Constructs a BatchFlatten module.
 
     Args:
+      preserve_dims: Number of leading dimensions that will not be reshaped.
+          For example, given an input Tensor with shape `[B, H, W, C]`:
+            * `preserve_dims=1` will return a Tensor with shape `[B, H*W*C]`.
+            * `preserve_dims=2` will return a Tensor with
+                shape `[B, H, W*C]`.
+            * `preserve_dims=3` will return the input itself,
+                shape `[B, H, W, C]`.
+            * `preserve_dims=4` will  return a Tensor with
+                shape `[B, H, W, C, 1]`.
+            * `preserve_dims>=5` will throw an error on build.
+          The preserved dimensions can be unknown at building time.
       name: Name of the module.
     """
-    super(BatchFlatten, self).__init__(name=name, shape=(-1,))
+    super(BatchFlatten, self).__init__(
+        shape=(-1,), preserve_dims=preserve_dims, name=name)
 
 
 class FlattenTrailingDimensions(BatchReshape):
@@ -662,14 +904,16 @@ class FlattenTrailingDimensions(BatchReshape):
   def __init__(self, dim_from, name="batch_dim_from"):
     """Constructs a FlattenTrailingDimensions module.
 
-    For example, given an input Tensor with shape `[B, H, W, C, D]`, where the
-    batch dimension `B` may not be statically known:
+    For example, given an input Tensor with shape `[B, H, W, C]`:
 
-      * `dim_from=1` will return a Tensor with shape `[B, H*W*C*D]`, which
-        is equivalent to `BatchFlatten`.
-      * `dim_from=2` will return a Tensor with shape `[B, H, W*C*D]`.
-      * `dim_from=3` will return a Tensor with shape `[B, H, W, C*D]`.
-      * `dim_from=4` will return a Tensor equivalent to input.
+      * `dim_from=1` will return a Tensor with shape `[B, H*W*C]`.
+      * `dim_from=2` will return a Tensor with shape `[B, H, W*C]`.
+      * `dim_from=3` will return the input itself.
+      * `dim_from=4` will return a Tensor with shape `[B, H, W, C, 1]`.
+      * `dim_from>=5` will generate a ValueError when building the module.
+      The preserved dimensions can be unknown at building time.
+
+    Equivalent to BatchFlatten(preserve_dims=dim_from, name=name).
 
     Args:
       dim_from: All dimensions after and including `dim_from` will
@@ -679,37 +923,10 @@ class FlattenTrailingDimensions(BatchReshape):
     Raises:
       ValueError: If `dim_from <= 0`.
     """
-    super(FlattenTrailingDimensions, self).__init__(name=name, shape=())
     if dim_from <= 0:
       raise ValueError("Argument dim_from should be >= 1.")
-    self._dim_from = dim_from
-
-  def _build(self, inputs):
-    """Connects the module into the graph, with input Tensor `inputs`.
-
-    Args:
-      inputs: A Tensor of dimension at least `dim_from+1`. Only the first
-        dimension may be statically unknown.
-
-    Returns:
-      A Tensor of dimension `dim_from+1`, where the size of all dimensions
-          up to `dim_from` are the same as in `inputs`, and the final
-          dimension has size equal to the product of the size of all dimensions
-          from `dim_from`.
-
-    Raises:
-      ValueError: If `inputs` has fewer dimensions than `dim_from`.
-                  If `inputs` has an statically unknown dimensions other than
-                  the first.
-    """
-    input_shape = inputs.get_shape().as_list()
-    if any([dim is None for dim in input_shape[1:]]):
-      raise ValueError("Input tensor has statically unknown dimension "
-                       "other than first dimension.")
-    if len(input_shape) < self._dim_from + 1:
-      raise ValueError("Input tensor has fewer dimensions than dim_from.")
-    self._shape = tuple(input_shape[1:self._dim_from] + [-1])
-    return super(FlattenTrailingDimensions, self)._build(inputs)
+    super(FlattenTrailingDimensions, self).__init__(
+        shape=(-1,), preserve_dims=dim_from, name=name)
 
 
 class TrainableVariable(base.AbstractModule):
@@ -723,6 +940,7 @@ class TrainableVariable(base.AbstractModule):
                initializers=None,
                partitioners=None,
                regularizers=None,
+               custom_getter=None,
                name="trainable_variable"):
     """Constructs a TrainableVariable module.
 
@@ -738,6 +956,8 @@ class TrainableVariable(base.AbstractModule):
         should be a function that takes a single `Tensor` as an input and
         returns a scalar `Tensor` output, e.g. the L1 and L2 regularizers in
         `tf.contrib.layers`.
+      custom_getter: Optional callable or dictionary of callables to use as
+        custom_getter for the module.
       name: Name of the module.
 
     Raises:
@@ -748,7 +968,8 @@ class TrainableVariable(base.AbstractModule):
       TypeError: If any of the given partitioners are not callable.
       TypeError: If any of the given regularizers are not callable.
     """
-    super(TrainableVariable, self).__init__(name=name)
+    super(TrainableVariable, self).__init__(custom_getter=custom_getter,
+                                            name=name)
 
     self._shape = tuple(shape)
     self._dtype = dtype
@@ -799,6 +1020,10 @@ class BatchApply(base.AbstractModule):
   connects the provided module, then splits the leading dimension of the
   result to match the input.
 
+  Input tensors whose rank is smaller than the number of dimensions to collapse
+  (e.g. all scalar values, which are tensors of rank 0), are passed unaltered to
+  the provided module.
+
   This is useful for applying some module to each timestep of a Time x Batch x N
   tensor. If a module is hard coded to only support 2D (Batch x N) then the
   full 3D Tensor cannot be provided. BatchApply will 'merge' the first two
@@ -835,31 +1060,44 @@ class BatchApply(base.AbstractModule):
     self._n_dims = n_dims
     self._input_example_index = input_example_index
 
-  def _build(self, inputs):
+  def _build(self, *args, **kwargs):
     """Connects the BatchApply module into the graph.
 
     Args:
-      inputs: a Tensor or a nested list of Tensors. The input tensors will
-          have their first dimensions merged, then an op or a module will be
-          called on the input. The first dimension of the output will be
-          split again based on the leading dimensions of the first input
-          tensor.
+      *args: a Tensor or a nested list or dictionary of Tensors. The input
+          tensors will have their first dimensions merged, then an op or a
+          module will be called on the input. The first dimension of the output
+          tensor(s) will be split again based on the leading dimensions of the
+          first input tensor.
+      **kwargs: Dictionary of named arguments; used in the same way as `*args`.
 
     Returns:
-      A Tensor resulting of applying the process above.
+      A Tensor or nested list or dictionary of Tensors as a result of applying
+      the process above. ("None" return values are also supported.)
     """
-    # Merge leading dimensions for each input Tensor, then apply inner module.
-    merged = nest.map(lambda inp: merge_leading_dims(inp, self._n_dims),
-                      inputs)
-    results = self._module(merged)
+    flattened = nest.flatten([args, kwargs])
+    merged_flattened = [
+        merge_leading_dims(inp, self._n_dims) if inp is not None else None
+        for inp in flattened]
+    merged_args, merged_kwargs = nest.pack_sequence_as([args, kwargs],
+                                                       merged_flattened)
+
+    results = self._module(*merged_args, **merged_kwargs)
 
     # Unmerging takes the sizes of the leading dimensions from an input example
     # with equal shape for the leading `n_dims` dimensions. Typically this is
     # the first input.
-    example_input = nest.flatten(inputs)[self._input_example_index]
+    example_input = tf.convert_to_tensor(flattened[self._input_example_index])
     def _split_to_original_leading_dims(result):
-      return split_leading_dim(result, example_input, self._n_dims)
-    return nest.map(_split_to_original_leading_dims, results)
+      if result is None:
+        return None
+      else:
+        return split_leading_dim(result, example_input, self._n_dims)
+
+    flat_results = nest.flatten(results)
+    flat_unmerged_results = [_split_to_original_leading_dims(result)
+                             for result in flat_results]
+    return nest.pack_sequence_as(results, flat_unmerged_results)
 
 
 class SliceByDim(base.AbstractModule):
@@ -1043,12 +1281,16 @@ class MergeDims(base.AbstractModule):
   For example, merging dimensions 1, 2 and 3 together can be performed by
   calling:
 
+  ```python
   output = MergeDims(start=1, size=3)(x)
+  ```
 
   A nested list of tensors can be merged:
 
+  ```python
   x = [tf.random_uniform(shape=[5, 5]), [tf.random_uniform(shape=[3, 3, 3])]]
   output = MergeDims(start=0, size=2)(x)
+  ```
   """
 
   def __init__(self, start, size, name="merge_dims"):
@@ -1071,16 +1313,43 @@ class MergeDims(base.AbstractModule):
       raise ValueError("`size` should be strictly greater than 1.")
 
   def _merge(self, tensor):
-    output_shape = tensor.get_shape().as_list()
-    rank = len(output_shape)
-    if rank < self._start + self._size:
+    static_input_shape = tensor.get_shape().as_list()
+    rank = len(static_input_shape)
+    start = self._start
+    if start < 0:
+      start += rank  # uses negative indexing from right
+
+    if rank < start + self._size:
       raise ValueError("Rank of inputs must be at least {}."
                        .format(self._start + self._size))
 
-    # Update the shape of the merged dimensions.
-    output_shape[self._start:self._start + self._size] = [-1]
+    initial = static_input_shape[:start]
+    middle = static_input_shape[start:start + self._size]
+    final = static_input_shape[start + self._size:]
+    if None in middle:
+      middle = [None]
+    else:
+      middle = [np.prod(middle)]
+    static_shape = initial + middle + final
 
-    return tf.reshape(tensor, shape=output_shape)
+    if static_shape.count(None) + static_shape.count(0) <= 1:
+      # At most one undefined (or zero) dimension, so tf.reshape can handle this
+      # case.
+      static_shape = [-1 if i is None else i for i in static_shape]
+      return tf.reshape(tensor, static_shape)
+    else:
+      # Need to compute output shape dynamically.
+      dynamic_input_shape = tf.shape(tensor)
+      dynamic_initial = dynamic_input_shape[:start]
+      dynamic_middle = tf.reduce_prod(
+          dynamic_input_shape[start:start + self._size], keep_dims=True)
+      dynamic_final = dynamic_input_shape[start + self._size:]
+      dynamic_shape = tf.concat(
+          [dynamic_initial, dynamic_middle, dynamic_final], axis=0)
+
+      tensor = tf.reshape(tensor, dynamic_shape)
+      tensor.set_shape(static_shape)  # give it some static shape information
+      return tensor
 
   def _build(self, inputs):
     """Connects the MergeDims module into the graph.
@@ -1153,7 +1422,7 @@ class SelectInput(base.AbstractModule):
     Raises:
       TypeError: If `idx` is not an list, tuple or integer.
     """
-    super(SelectInput, self).__init__(name)
+    super(SelectInput, self).__init__(name=name)
     self._check_type(idx)
     self._idx = idx
 

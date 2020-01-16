@@ -12,9 +12,13 @@ py_library(
     srcs = [
         "__init__.py",
     ],
+    srcs_version = "PY2AND3",
     visibility = ["//visibility:public"],
     deps = [
+        # semantic_version dep,
+        "//sonnet/python:custom_getters",
         "//sonnet/python:modules",
         "//sonnet/python:ops",
+        # tensorflow dep,
     ],
 )

@@ -11,16 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """"Implementation of Spatial Transformer networks core components."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import abc
-from itertools import chain
+import itertools
 
+# Dependency imports
 import numpy as np
+from six.moves import xrange  # pylint: disable=redefined-builtin
 from sonnet.python.modules import base
 from sonnet.python.modules import basic
 import tensorflow as tf
@@ -62,7 +65,7 @@ class GridWarper(base.AbstractModule):
       Error: If `len(output_shape) > len(source_shape)`.
       TypeError: If `output_shape` and `source_shape` are not both iterable.
     """
-    super(GridWarper, self).__init__(name)
+    super(GridWarper, self).__init__(name=name)
 
     self._source_shape = tuple(source_shape)
     self._output_shape = tuple(output_shape)
@@ -175,7 +178,7 @@ class AffineGridWarper(GridWarper):
         on the entries of a matrix defining an affine transformation in N
         dimensions, or an `AffineWarpConstraints` object. If the double list is
         passed, a numeric value bakes in a constraint on the corresponding
-        entry in the tranformation matrix, whereas `None` implies that the
+        entry in the transformation matrix, whereas `None` implies that the
         corresponding entry will be specified at run time.
       name: Name of module.
 
@@ -381,7 +384,7 @@ class AffineGridWarper(GridWarper):
     def _affine_grid_warper_inverse(inputs):
       """Assembles network to compute inverse affine transformation.
 
-      Each `inputs` row potentailly contains [a, b, tx, c, d, ty]
+      Each `inputs` row potentially contains [a, b, tx, c, d, ty]
       corresponding to an affine matrix:
 
         A = [a, b, tx],
@@ -417,13 +420,13 @@ class AffineGridWarper(GridWarper):
       index = iter(range(6))
       def get_variable(constraint):
         if constraint is None:
-          i = index.next()
+          i = next(index)
           return inputs[:, i:i+1]
         else:
           return tf.fill(constant_shape, tf.constant(constraint,
                                                      dtype=inputs.dtype))
 
-      constraints = chain.from_iterable(self.constraints)
+      constraints = itertools.chain.from_iterable(self.constraints)
       a, b, tx, c, d, ty = (get_variable(constr) for constr in constraints)
 
       det = a * d - b * c
@@ -447,6 +450,7 @@ class AffineGridWarper(GridWarper):
       agw = AffineGridWarper(self.output_shape,
                              self.source_shape)
 
+
       return agw(inverse_gw_inputs)  # pylint: disable=not-callable
 
     if name is None:
@@ -468,7 +472,7 @@ class AffineWarpConstraints(object):
       constraints: A doubly-nested iterable of shape `[N, N+1]` defining
         constraints on the entries of a matrix that represents an affine
         transformation in `N` dimensions. A numeric value bakes in a constraint
-        on the corresponding entry in the tranformation matrix, whereas `None`
+        on the corresponding entry in the transformation matrix, whereas `None`
         implies that the corresponding entry will be specified at run time.
 
     Raises:

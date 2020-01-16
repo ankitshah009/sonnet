@@ -11,64 +11,76 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Tests for snt.nets.alexnet."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
+# Dependency imports
+from absl.testing import parameterized
 import numpy as np
-import sonnet as snt
-import tensorflow as tf
 
+import sonnet as snt
+
+import tensorflow as tf
 from tensorflow.python.ops import variables
 
 
-class AlexNetTest(tf.test.TestCase):
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class AlexNetTest(parameterized.TestCase, tf.test.TestCase):
 
   def testCalcMinSize(self):
     """Test the minimum input size calculator."""
-    net = snt.nets.AlexNet(mode=snt.nets.AlexNet.MINI)
+    net = snt.nets.AlexNetMini()
 
     self.assertEqual(net._calc_min_size([(None, (3, 1), None)]), 3)
     self.assertEqual(net._calc_min_size([(None, (3, 1), (3, 2))]), 5)
     self.assertEqual(net._calc_min_size([(None, (3, 1), (3, 2)),
                                          (None, (3, 2), (5, 2))]), 25)
 
-  def testModes(self):
+  @parameterized.named_parameters(
+      ("full", functools.partial(snt.nets.AlexNet, mode=snt.nets.AlexNet.FULL)),
+      ("mini", functools.partial(snt.nets.AlexNet, mode=snt.nets.AlexNet.MINI)),
+      ("full_module", snt.nets.AlexNetFull),
+      ("mini_module", snt.nets.AlexNetMini),
+  )
+  def testModes(self, module):
     """Test that each mode can be instantiated."""
+    keep_prob = 0.7
+    net = module()
+    input_shape = [1, net._min_size, net._min_size, 3]
+    inputs = tf.ones(dtype=tf.float32, shape=input_shape)
+    net(inputs, keep_prob, is_training=True)
 
-    modes = [
-        snt.nets.AlexNet.FULL,
-        snt.nets.AlexNet.HALF,
-        snt.nets.AlexNet.MINI,
-    ]
-
-    keep_prob = tf.placeholder(tf.float32)
-
-    for mode in modes:
-      net = snt.nets.AlexNet(name="net_{}".format(mode), mode=mode)
-      input_shape = [None, net._min_size, net._min_size, 3]
-      inputs = tf.placeholder(tf.float32, shape=input_shape)
-      net(inputs, keep_prob)
-
-  def testBatchNorm(self):
+  @parameterized.named_parameters(
+      ("all_layers", True),
+      ("conv_only", False))
+  def testBatchNorm(self, bn_on_fc_layers):
     """Test that batch norm can be instantiated."""
 
-    net = snt.nets.AlexNet(mode=snt.nets.AlexNet.FULL,
-                           use_batch_norm=True)
+    net = snt.nets.AlexNet(
+        mode=snt.nets.AlexNet.FULL,
+        use_batch_norm=True,
+        bn_on_fc_layers=bn_on_fc_layers)
     input_shape = [net._min_size, net._min_size, 3]
-    inputs = tf.placeholder(tf.float32, shape=[None] + input_shape)
-    output = net(inputs)
+    inputs = tf.ones(dtype=tf.float32, shape=[1] + input_shape)
+    output = net(inputs, is_training=True)
 
-    with self.test_session() as sess:
-      sess.run(tf.global_variables_initializer())
-      sess.run(output, feed_dict={inputs: np.random.rand(10, *input_shape)})
+    self.evaluate(tf.global_variables_initializer())
+    self.evaluate(output)
+
+    # Check that an error is raised if we don't specify the is_training flag
+    err = "is_training flag must be explicitly specified"
+    with self.assertRaisesRegexp(ValueError, err):
+      net(inputs)
 
     # Check Tensorflow flags work
-    is_training = tf.placeholder(tf.bool)
-    test_local_stats = tf.placeholder(tf.bool)
+    is_training = tf.constant(False)
+    test_local_stats = tf.constant(False)
     net(inputs,
         is_training=is_training,
         test_local_stats=test_local_stats)
@@ -82,50 +94,68 @@ class AlexNetTest(tf.test.TestCase):
     var_names = [var.name for var in tf.global_variables()]
     self.assertIn(variance_name, var_names)
     self.assertIn(mean_name, var_names)
+    if bn_on_fc_layers:
+      self.assertEqual(35, len(var_names))
+    else:
+      self.assertEqual(29, len(var_names))
 
   def testBatchNormConfig(self):
     batch_norm_config = {
         "scale": True,
     }
 
-    model = snt.nets.AlexNet(mode=snt.nets.AlexNet.FULL,
-                             use_batch_norm=True,
-                             batch_norm_config=batch_norm_config)
+    model = snt.nets.AlexNetFull(use_batch_norm=True,
+                                 batch_norm_config=batch_norm_config)
 
-    input_to_net = tf.placeholder(tf.float32, shape=(1, 224, 224, 3))
+    input_to_net = tf.ones(dtype=tf.float32, shape=(1, 224, 224, 3))
 
-    model(input_to_net)
+    model(input_to_net, is_training=True)
     model_variables = model.get_variables()
 
-    self.assertEqual(len(model_variables), 7 * 4)
+    self.assertEqual(len(model_variables), 6 * 4)
+
+  def testNoDropoutInTesting(self):
+    """An exception should be raised if trying to use dropout when testing."""
+    net = snt.nets.AlexNetFull()
+    input_shape = [net._min_size, net._min_size, 3]
+    inputs = tf.ones(dtype=tf.float32, shape=[1] + input_shape)
+
+    with self.assertRaisesRegexp(tf.errors.InvalidArgumentError, "keep_prob"):
+      output = net(inputs, keep_prob=0.7, is_training=False)
+      self.evaluate(tf.global_variables_initializer())
+      self.evaluate(output)
+
+    # No exception if keep_prob=1
+    output = net(inputs, keep_prob=1.0, is_training=False)
+    self.evaluate(output)
 
   def testInputTooSmall(self):
     """Check that an error is raised if the input image is too small."""
 
-    keep_prob = tf.placeholder(tf.float32)
-    net = snt.nets.AlexNet(mode=snt.nets.AlexNet.FULL)
+    keep_prob = 0.7
+    net = snt.nets.AlexNetFull()
 
-    input_shape = [None, net._min_size, net._min_size, 1]
-    inputs = tf.placeholder(tf.float32, shape=input_shape)
-    net(inputs, keep_prob)
+    input_shape = [1, net._min_size, net._min_size, 1]
+    inputs = tf.ones(dtype=tf.float32, shape=input_shape)
+    net(inputs, keep_prob, is_training=True)
 
     with self.assertRaisesRegexp(snt.IncompatibleShapeError,
                                  "Image shape too small: (.*?, .*?) < .*?"):
-      input_shape = [None, net._min_size - 1, net._min_size - 1, 1]
-      inputs = tf.placeholder(tf.float32, shape=input_shape)
-      net(inputs, keep_prob)
+      input_shape = [1, net._min_size - 1, net._min_size - 1, 1]
+      inputs = tf.ones(dtype=tf.float32, shape=input_shape)
+      net(inputs, keep_prob, is_training=True)
 
   def testSharing(self):
     """Check that the correct number of variables are made when sharing."""
 
-    net = snt.nets.AlexNet(mode=snt.nets.AlexNet.MINI)
-    inputs1 = tf.placeholder(tf.float32, shape=[None, 64, 64, 3])
-    inputs2 = tf.placeholder(tf.float32, shape=[None, 64, 64, 3])
-    keep_prob1 = tf.placeholder(tf.float32)
-    keep_prob2 = tf.placeholder(tf.float32)
+    net = snt.nets.AlexNetMini()
+    inputs1 = tf.ones(dtype=tf.float32, shape=[1, 64, 64, 3])
+    inputs2 = tf.ones(dtype=tf.float32, shape=[1, 64, 64, 3])
+    keep_prob1 = 0.7
+    keep_prob2 = 0.5
 
-    net(inputs1, keep_prob1)
-    net(inputs2, keep_prob2)
+    net(inputs1, keep_prob1, is_training=True)
+    net(inputs2, keep_prob2, is_training=True)
 
     self.assertEqual(len(tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)),
                      7 * 2)
@@ -136,66 +166,68 @@ class AlexNetTest(tf.test.TestCase):
   def testInvalidInitializationParameters(self):
     err = "Invalid initializer keys.*"
     with self.assertRaisesRegexp(KeyError, err):
-      snt.nets.AlexNet(
+      snt.nets.AlexNetMini(
           initializers={"not_w": tf.truncated_normal_initializer(stddev=1.0)})
 
     err = "Initializer for 'w' is not a callable function"
     with self.assertRaisesRegexp(TypeError, err):
-      snt.nets.AlexNet(initializers={"w": tf.zeros([1, 2, 3])})
+      snt.nets.AlexNetMini(
+          initializers={"w": tf.zeros([1, 2, 3])})
 
   def testInvalidRegularizationParameters(self):
     with self.assertRaisesRegexp(KeyError, "Invalid regularizer keys.*"):
-      snt.nets.AlexNet(
+      snt.nets.AlexNetMini(
           regularizers={"not_w": tf.contrib.layers.l1_regularizer(scale=0.5)})
 
     err = "Regularizer for 'w' is not a callable function"
     with self.assertRaisesRegexp(TypeError, err):
-      snt.nets.AlexNet(regularizers={"w": tf.zeros([1, 2, 3])})
+      snt.nets.AlexNetMini(
+          regularizers={"w": tf.zeros([1, 2, 3])})
 
   def testRegularizersInRegularizationLosses(self):
     regularizers = {"w": tf.contrib.layers.l1_regularizer(scale=0.5),
                     "b": tf.contrib.layers.l2_regularizer(scale=0.5)}
 
-    alex_net = snt.nets.AlexNet(regularizers=regularizers, name="alexnet1")
+    alex_net = snt.nets.AlexNetMini(
+        regularizers=regularizers, name="alexnet1")
 
     input_shape = [alex_net._min_size, alex_net._min_size, 3]
-    inputs = tf.placeholder(tf.float32, shape=[None] + input_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=[1] + input_shape)
     alex_net(inputs)
 
     graph_regularizers = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
 
     alex_net_conv_layers = len(alex_net.conv_modules)
-    for i in range(0, 2 * alex_net_conv_layers, 2):
-      self.assertRegexpMatches(graph_regularizers[i].name, ".*l1_regularizer.*")
-      self.assertRegexpMatches(
-          graph_regularizers[i + 1].name, ".*l2_regularizer.*")
+    self.assertEqual(len(graph_regularizers), 2 * alex_net_conv_layers)
 
   def testInitializers(self):
     initializers = {
         "w": tf.constant_initializer(1.5),
         "b": tf.constant_initializer(2.5),
     }
-    alex_net = snt.nets.AlexNet(mode=snt.nets.AlexNet.FULL,
-                                initializers=initializers)
-    input_shape = [None, alex_net.min_input_size, alex_net.min_input_size, 3]
-    inputs = tf.placeholder(dtype=tf.float32, shape=input_shape)
+    alex_net = snt.nets.AlexNetFull(initializers=initializers)
+    input_shape = [1, alex_net.min_input_size, alex_net.min_input_size, 3]
+    inputs = tf.ones(dtype=tf.float32, shape=input_shape)
     alex_net(inputs)
     init = tf.global_variables_initializer()
 
-    with self.test_session() as sess:
-      sess.run(init)
-      for conv_module in alex_net.conv_modules:
-        w_v, b_v = sess.run([conv_module.w, conv_module.b])
-        self.assertAllClose(w_v, 1.5 * np.ones(w_v.shape))
-        self.assertAllClose(b_v, 2.5 * np.ones(b_v.shape))
+    self.evaluate(init)
+    for module in alex_net.conv_modules + alex_net.linear_modules:
+      w_v, b_v = self.evaluate([module.w, module.b])
+      self.assertAllClose(w_v, 1.5 * np.ones(w_v.shape))
+      self.assertAllClose(b_v, 2.5 * np.ones(b_v.shape))
 
   def testPartitioners(self):
+    if tf.executing_eagerly():
+      self.skipTest("Eager does not support partitioned variables.")
+
     partitioners = {
         "w": tf.fixed_size_partitioner(num_shards=2),
         "b": tf.fixed_size_partitioner(num_shards=2),
     }
 
-    alex_net = snt.nets.AlexNet(partitioners=partitioners, name="alexnet1")
+    alex_net = snt.nets.AlexNetMini(
+        partitioners=partitioners, name="alexnet1")
 
     input_shape = [alex_net._min_size, alex_net._min_size, 3]
     inputs = tf.placeholder(tf.float32, shape=[None] + input_shape)
@@ -210,21 +242,37 @@ class AlexNetTest(tf.test.TestCase):
       self.assertEqual(type(linear_module.b), variables.PartitionedVariable)
 
   def testErrorHandling(self):
-    err = "`batch_norm_config` must be a mapping, e.g. `dict`."
-    with self.assertRaisesRegexp(TypeError, err):
-      snt.nets.AlexNet(batch_norm_config="not a valid config")
-
     err = "AlexNet construction mode 'BLAH' not recognised"
     with self.assertRaisesRegexp(snt.Error, err):
       snt.nets.AlexNet(mode="BLAH")
 
   def testGetLinearModules(self):
-    alex_net = snt.nets.AlexNet(mode=snt.nets.AlexNet.FULL)
-    input_shape = [None, alex_net.min_input_size, alex_net.min_input_size, 3]
-    inputs = tf.placeholder(dtype=tf.float32, shape=input_shape)
+    alex_net = snt.nets.AlexNetFull()
+    input_shape = [1, alex_net.min_input_size, alex_net.min_input_size, 3]
+    inputs = tf.ones(dtype=tf.float32, shape=input_shape)
     alex_net(inputs)
     for mod in alex_net.linear_modules:
       self.assertEqual(mod.output_size, 4096)
+
+  def testCustomGetterUsed(self):
+
+    const = 42.
+
+    def set_to_const(getter, *args, **kwargs):
+      variable = getter(*args, **kwargs)
+      return 0.0 * variable + const
+
+    alex_net = snt.nets.AlexNetFull(custom_getter=set_to_const)
+    input_shape = [1, alex_net.min_input_size, alex_net.min_input_size, 3]
+    inputs = tf.ones(dtype=tf.float32, shape=input_shape)
+    alex_net(inputs)
+
+    self.evaluate(tf.global_variables_initializer())
+    for module in alex_net.conv_modules + alex_net.linear_modules:
+      var_w, var_b = self.evaluate([module.w, module.b])
+      self.assertAllClose(var_w, np.zeros_like(var_w) + const)
+      self.assertAllClose(var_b, np.zeros_like(var_b) + const)
+
 
 if __name__ == "__main__":
   tf.test.main()

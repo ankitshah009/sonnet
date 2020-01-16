@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Tests for sonnet.python.modules.basic."""
 from __future__ import absolute_import
 from __future__ import division
@@ -19,15 +20,19 @@ from __future__ import print_function
 
 import collections
 
-from nose_parameterized import parameterized
+# Dependency imports
+
+from absl.testing import parameterized
 import numpy as np
+from six.moves import xrange  # pylint: disable=redefined-builtin
 import sonnet as snt
+from sonnet.python.modules import basic
+from sonnet.python.ops import nest
 import tensorflow as tf
 
 from tensorflow.python.client import device_lib
 from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import variables
-from tensorflow.python.util import nest
 
 
 def _test_initializer(mu=0.0, sigma=1.0, dtype=tf.float32):
@@ -40,7 +45,37 @@ def _test_initializer(mu=0.0, sigma=1.0, dtype=tf.float32):
   return _initializer
 
 
-class LinearTest(tf.test.TestCase):
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class ConcatLinearTest(tf.test.TestCase, parameterized.TestCase):
+
+  def setUp(self):
+    super(ConcatLinearTest, self).setUp()
+
+    self.batch_size = 11
+    self.in_sizes = [5, 19]
+    self.out_size = 17
+    self.seed = 42
+
+  @parameterized.named_parameters(
+      ("WithBias", True),
+      ("WithoutBias", False))
+  def testShape(self, use_bias):
+    inputs = [tf.ones(shape=[self.batch_size, size]) for size in self.in_sizes]
+    lin = snt.ConcatLinear(output_size=self.out_size, use_bias=use_bias)
+    output = lin(inputs)
+    self.assertTrue(
+        output.get_shape().is_compatible_with([self.batch_size, self.out_size]))
+
+  def testName(self):
+    mod_name = "unique_name"
+    with tf.variable_scope("scope"):
+      lin = snt.ConcatLinear(name=mod_name, output_size=self.out_size)
+    self.assertEqual(lin.scope_name, "scope/" + mod_name)
+    self.assertEqual(lin.module_name, mod_name)
+
+
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class LinearTest(tf.test.TestCase, parameterized.TestCase):
 
   def setUp(self):
     super(LinearTest, self).setUp()
@@ -50,12 +85,11 @@ class LinearTest(tf.test.TestCase):
     self.out_size = 17
     self.seed = 42
 
-  @parameterized.expand([
+  @parameterized.named_parameters(
       ("WithBias", True),
-      ("WithoutBias", False)])
-  def testShape(self, _, use_bias):
-
-    inputs = tf.placeholder(tf.float32, shape=[self.batch_size, self.in_size])
+      ("WithoutBias", False))
+  def testShape(self, use_bias):
+    inputs = tf.ones(dtype=tf.float32, shape=[self.batch_size, self.in_size])
     lin = snt.Linear(output_size=self.out_size, use_bias=use_bias)
     output = lin(inputs)
     self.assertTrue(
@@ -68,15 +102,11 @@ class LinearTest(tf.test.TestCase):
     self.assertEqual(lin.scope_name, "scope/" + mod_name)
     self.assertEqual(lin.module_name, mod_name)
 
-    # Test deprecated name.
-    self.assertEqual(lin.name, "scope/" + mod_name)
-
-  @parameterized.expand([
+  @parameterized.named_parameters(
       ("WithBias", True),
-      ("WithoutBias", False)])
-  def testVariables(self, _, use_bias):
-
-    inputs = tf.placeholder(tf.float32, shape=[self.batch_size, self.in_size])
+      ("WithoutBias", False))
+  def testVariables(self, use_bias):
+    inputs = tf.ones(dtype=tf.float32, shape=[self.batch_size, self.in_size])
     lin = snt.Linear(output_size=self.out_size, use_bias=use_bias)
 
     err = r"Variables in {} not instantiated yet, __call__ the module first."
@@ -98,12 +128,12 @@ class LinearTest(tf.test.TestCase):
 
     variables_ = lin.get_variables()
     if use_bias:
-      self.assertEqual(len(variables_), 2, "Linear should have 2 variables.")
+      self.assertLen(variables_, 2, "Linear should have 2 variables.")
     else:
       err = "No bias Variable in Linear Module when `use_bias=False`."
       with self.assertRaisesRegexp(AttributeError, err):
         _ = lin.b
-      self.assertEqual(len(variables_), 1, "Linear should have 1 variable.")
+      self.assertLen(variables_, 1, "Linear should have 1 variable.")
 
     for v in variables_:
       self.assertRegexpMatches(v.name,
@@ -112,20 +142,45 @@ class LinearTest(tf.test.TestCase):
         shape = np.ndarray((self.in_size, self.out_size))
       else:
         shape = np.ndarray(self.out_size)
-      self.assertShapeEqual(shape, v.initial_value)
+      self.assertShapeEqual(shape, tf.convert_to_tensor(v))
 
-  @parameterized.expand([
+  def testCustomGetter(self):
+    """Check that custom getters work appropriately."""
+
+    def custom_getter(getter, *args, **kwargs):
+      kwargs["trainable"] = False
+      return getter(*args, **kwargs)
+
+    inputs = tf.ones(dtype=tf.float32, shape=[self.batch_size, self.in_size])
+
+    # Make w and b non-trainable.
+    lin1 = snt.Linear(output_size=self.out_size,
+                      custom_getter=custom_getter)
+    lin1(inputs)
+    self.assertEmpty(tf.trainable_variables())
+    self.assertLen(tf.global_variables(), 2)
+
+    # Make w non-trainable.
+    lin2 = snt.Linear(output_size=self.out_size,
+                      custom_getter={"w": custom_getter})
+    lin2(inputs)
+    self.assertLen(tf.trainable_variables(), 1)
+    self.assertLen(tf.global_variables(), 4)
+
+  @parameterized.named_parameters(
       ("WithBias", True),
-      ("WithoutBias", False)])
-  def testComputation(self, _, use_bias):
-
+      ("WithoutBias", False))
+  def testComputation(self, use_bias):
     np.random.seed(self.seed)
     types = (tf.float16, tf.float32, tf.float64)
     tol = (1e-2, 1e-6, 1e-9)
     tolerance_map = dict(zip(types, tol))
 
     for dtype in types:
-      inputs = tf.placeholder(dtype, shape=[self.batch_size, self.in_size])
+      # With random data, check the TF calculation matches the Numpy version.
+      input_data = np.random.randn(self.batch_size,
+                                   self.in_size).astype(dtype.as_numpy_dtype)
+      inputs = tf.constant(input_data)
 
       if use_bias:
         initializers = {"w": _test_initializer(), "b": _test_initializer()}
@@ -136,17 +191,12 @@ class LinearTest(tf.test.TestCase):
                        use_bias=use_bias,
                        initializers=initializers)
       output = lin(inputs)
-      with self.test_session() as sess:
-        # With random data, check the TF calculation matches the Numpy version.
-        input_data = np.random.randn(self.batch_size,
-                                     self.in_size).astype(dtype.as_numpy_dtype)
-        sess.run(tf.global_variables_initializer())
-        if use_bias:
-          output_data, w, b = sess.run([output, lin.w, lin.b],
-                                       {inputs: input_data})
-        else:
-          output_data, w = sess.run([output, lin.w],
-                                    {inputs: input_data})
+
+      self.evaluate(tf.global_variables_initializer())
+      if use_bias:
+        output_data, w, b = self.evaluate([output, lin.w, lin.b])
+      else:
+        output_data, w = self.evaluate([output, lin.w])
 
       if use_bias:
         result = (np.dot(input_data, w.astype(dtype.as_numpy_dtype)) +
@@ -160,14 +210,16 @@ class LinearTest(tf.test.TestCase):
           atol=tolerance_map[dtype],
           rtol=tolerance_map[dtype])
 
-  @parameterized.expand([
+  @parameterized.named_parameters(
       ("WithBias", True),
-      ("WithoutBias", False)])
-  def testSharing(self, _, use_bias):
+      ("WithoutBias", False))
+  def testSharing(self, use_bias):
 
     np.random.seed(self.seed)
-    inp_1 = tf.placeholder(tf.float32, shape=[self.batch_size, self.in_size])
-    inp_2 = tf.placeholder(tf.float32, shape=[self.batch_size, self.in_size])
+    input_data = np.random.randn(self.batch_size,
+                                 self.in_size).astype(np.float32)
+    inp_1 = tf.constant(input_data)
+    inp_2 = tf.constant(input_data)
 
     if use_bias:
       initializers = {"w": _test_initializer(), "b": _test_initializer()}
@@ -179,18 +231,15 @@ class LinearTest(tf.test.TestCase):
                      initializers=initializers)
     out_1 = lin(inp_1)
     out_2 = lin(inp_2)
-    with self.test_session() as sess:
-      # Put the same data into each input, outputs should be identical.
-      input_data = np.random.randn(self.batch_size, self.in_size)
-      sess.run(tf.global_variables_initializer())
-      out_data_1, out_data_2 = sess.run([out_1, out_2],
-                                        {inp_1: input_data, inp_2: input_data})
+    # With the same data into each input, outputs should be identical.
+    self.evaluate(tf.global_variables_initializer())
+    out_data_1, out_data_2 = self.evaluate([out_1, out_2])
     self.assertAllEqual(out_data_1, out_data_2)
 
   def testUniquifying(self):
     # Create three modules in same scope with same name - make_template will
     # uniquify them.
-    inp = tf.placeholder(tf.float32, shape=[self.batch_size, self.in_size])
+    inp = tf.ones(dtype=tf.float32, shape=[self.batch_size, self.in_size])
     mod_name = "another_linear_module"
     lin1 = snt.Linear(name=mod_name, output_size=self.out_size)
     lin2 = snt.Linear(name=mod_name, output_size=self.out_size)
@@ -223,9 +272,8 @@ class LinearTest(tf.test.TestCase):
       self.assertRegexpMatches(v.name, r"{}/[wb]:0".format(lin3.scope_name))
 
   def testIsConnected(self):
-    bad_inputs = tf.placeholder(tf.float32, shape=[self.batch_size,
-                                                   self.in_size,
-                                                   self.in_size])
+    bad_inputs = tf.ones(
+        dtype=tf.float32, shape=[self.batch_size, self.in_size, self.in_size])
     lin = snt.Linear(output_size=self.out_size)
 
     self.assertFalse(lin.is_connected)
@@ -238,6 +286,8 @@ class LinearTest(tf.test.TestCase):
     self.assertFalse(lin.is_connected)
 
   def testUnknownInputSize(self):
+    if tf.executing_eagerly():
+      self.skipTest("Inputs with unknown shape are not supported in eager.")
     bad_inputs = tf.placeholder(tf.float32, shape=[self.batch_size, None])
     lin = snt.Linear(output_size=self.out_size)
 
@@ -291,14 +341,43 @@ class LinearTest(tf.test.TestCase):
     lin(inputs)
 
     regularizers = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-    self.assertRegexpMatches(regularizers[0].name, ".*l1_regularizer.*")
-    self.assertRegexpMatches(regularizers[1].name, ".*l2_regularizer.*")
+    self.assertLen(regularizers, 2)
+    if not tf.executing_eagerly():
+      self.assertRegexpMatches(regularizers[0].name, ".*l1_regularizer.*")
+      self.assertRegexpMatches(regularizers[1].name, ".*l2_regularizer.*")
 
-  @parameterized.expand([
+  def testClone(self):
+    inputs = tf.zeros([1, 100])
+    linear = snt.Linear(output_size=self.out_size)
+    clone1 = linear.clone()
+    clone2 = linear.clone(name="clone2")
+
+    linear(inputs)
+    clone1(inputs)
+    clone2(inputs)
+
+    all_vars = tf.trainable_variables()
+    linear_vars = tf.get_collection(
+        tf.GraphKeys.TRAINABLE_VARIABLES,
+        scope=linear.variable_scope.name + "/")
+    clone1_vars = tf.get_collection(
+        tf.GraphKeys.TRAINABLE_VARIABLES,
+        scope=clone1.variable_scope.name + "/")
+    clone2_vars = tf.get_collection(
+        tf.GraphKeys.TRAINABLE_VARIABLES,
+        scope=clone2.variable_scope.name + "/")
+
+    self.assertEqual(linear.output_size, clone1.output_size)
+    self.assertEqual(linear.module_name + "_clone", clone1.module_name)
+    self.assertEqual("clone2", clone2.module_name)
+    self.assertLen(all_vars, 3*len(linear_vars))
+    self.assertLen(linear_vars, len(clone1_vars))
+    self.assertLen(linear_vars, len(clone2_vars))
+
+  @parameterized.named_parameters(
       ("WithBias", True),
-      ("WithoutBias", False)])
-  def testTranspose(self, _, use_bias):
-
+      ("WithoutBias", False))
+  def testTranspose(self, use_bias):
     with tf.variable_scope("scope1"):
       linear1 = snt.Linear(output_size=self.out_size,
                            use_bias=use_bias,
@@ -322,8 +401,8 @@ class LinearTest(tf.test.TestCase):
     self.assertEqual("scope2/linear_1_transpose", linear_transpose3.scope_name)
     self.assertEqual("linear_1_transpose", linear_transpose3.module_name)
 
-    input_to_linear = tf.placeholder(tf.float32, shape=[self.batch_size,
-                                                        self.in_size])
+    input_to_linear = tf.ones(
+        dtype=tf.float32, shape=[self.batch_size, self.in_size])
 
     err = ("Variables in {} not instantiated yet, __call__ the "
            "module first.".format(linear1.scope_name))
@@ -366,7 +445,7 @@ class LinearTest(tf.test.TestCase):
     linear = snt.Linear(n_outputs)
     with tf.device("/cpu:*"):
       # Set up data.
-      inputs = tf.placeholder(tf.float32, [batch_size, n_inputs])
+      inputs = tf.ones(dtype=tf.float32, shape=[batch_size, n_inputs])
       labels = tf.to_int64(np.ones((batch_size)))
       # Predictions.
       with tf.device("/gpu:*"):
@@ -380,12 +459,18 @@ class LinearTest(tf.test.TestCase):
       optimizer.minimize(loss, colocate_gradients_with_ops=True)
     init = tf.global_variables_initializer()
     try:
-      with self.test_session(force_gpu=True) as sess:
-        sess.run(init)
+      if tf.executing_eagerly():
+        # Unify on evaluate once force_gpu supports eager.
+        self.evaluate(init)
+      else:
+        with self.test_session(force_gpu=True) as sess:
+          sess.run(init)
     except tf.errors.InvalidArgumentError as e:
       self.fail("Cannot start the session. Details:\n" + e.message)
 
   def testPartitioners(self):
+    if tf.executing_eagerly():
+      self.skipTest("Partitioned variables are not supported in eager mode.")
     inputs = tf.zeros([1, 100])
     partitioners = {
         "w": tf.variable_axis_size_partitioner(10000),
@@ -397,8 +482,39 @@ class LinearTest(tf.test.TestCase):
     self.assertEqual(type(linear.w), variables.PartitionedVariable)
     self.assertEqual(type(linear.b), variables.PartitionedVariable)
 
+  @parameterized.named_parameters(
+      ("float16", tf.float16),
+      ("bfloat16", tf.bfloat16),
+      ("float32", tf.float32),
+      ("float64", tf.float64))
+  def testFloatDataTypeConsistent(self, dtype):
+    inputs = tf.ones(dtype=dtype, shape=[3, 7])
+    linear = snt.Linear(11)
+    outputs = linear(inputs)
+    self.assertEqual(linear.w.dtype.base_dtype, dtype)
+    self.assertEqual(linear.b.dtype.base_dtype, dtype)
+    self.assertEqual(outputs.dtype.base_dtype, dtype)
 
-class AddBiasTest(tf.test.TestCase):
+  def testIntegerDataTypeFailsWithDefaultInitializers(self):
+    dtype = tf.int32
+    inputs = tf.ones(dtype=dtype, shape=[3, 7])
+    linear = snt.Linear(11)
+    with self.assertRaisesRegexp(ValueError, "Expected floating point type"):
+      unused_outputs = linear(inputs)
+
+  def testIntegerDataTypeConsistentWithCustomWeightInitializer(self):
+    dtype = tf.int32
+    inputs = tf.ones(dtype=dtype, shape=[3, 7])
+    linear = snt.Linear(
+        11, initializers={"w": tf.zeros_initializer(dtype=dtype)})
+    outputs = linear(inputs)
+    self.assertEqual(linear.w.dtype.base_dtype, dtype)
+    self.assertEqual(linear.b.dtype.base_dtype, dtype)
+    self.assertEqual(outputs.dtype.base_dtype, dtype)
+
+
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class AddBiasTest(tf.test.TestCase, parameterized.TestCase):
 
   BATCH_SIZE = 11
   IN_SHAPE = (13, 7, 5)
@@ -420,28 +536,25 @@ class AddBiasTest(tf.test.TestCase):
     self.mb_out_shape = (self.BATCH_SIZE,) + self.OUT_SHAPE
     self.seed = 42
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testShape(self, _, bias_dims, unused_bias_shape):
-
-    inputs = tf.placeholder(tf.float32, shape=self.mb_in_shape)
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testShape(self, bias_dims, unused_bias_shape):
+    inputs = tf.ones(dtype=tf.float32, shape=self.mb_in_shape)
     add = snt.AddBias(bias_dims=bias_dims)
     output = add(inputs)
     self.assertTrue(
         output.get_shape().is_compatible_with(self.mb_out_shape))
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testName(self, _, bias_dims, unused_bias_shape):
-
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testName(self, bias_dims, unused_bias_shape):
     mod_name = "unique_name"
     with tf.variable_scope("scope"):
       add = snt.AddBias(name=mod_name, bias_dims=bias_dims)
     self.assertEqual(add.scope_name, "scope/" + mod_name)
     self.assertEqual(add.module_name, mod_name)
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testVariables(self, _, bias_dims, bias_shape):
-
-    inputs = tf.placeholder(tf.float32, shape=self.mb_in_shape)
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testVariables(self, bias_dims, bias_shape):
+    inputs = tf.ones(dtype=tf.float32, shape=self.mb_in_shape)
     add = snt.AddBias(bias_dims=bias_dims)
 
     err = ("Variables in {} not instantiated yet, __call__ "
@@ -457,70 +570,76 @@ class AddBiasTest(tf.test.TestCase):
     add(inputs)  # Connect the module, but ignore the return value.
 
     variables_ = add.get_variables()
-    self.assertEqual(len(variables_), 1, "Add should have 1 variable.")
+    self.assertLen(variables_, 1, "Add should have 1 variable.")
 
     for v in variables_:
-      self.assertRegexpMatches(v.name, r"{}/[b]:0".format(add.scope_name))
+      if not tf.executing_eagerly():
+        self.assertRegexpMatches(v.name, r"{}/[b]:0".format(add.scope_name))
       shape = np.ndarray(bias_shape)
-      self.assertShapeEqual(shape, v.initial_value)
+      self.assertShapeEqual(shape, tf.convert_to_tensor(v))
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testComputation(self, _, bias_dims, bias_shape):
-
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testComputation(self, bias_dims, bias_shape):
     np.random.seed(self.seed)
     types = (tf.float16, tf.float32, tf.float64)
     tol = (1e-2, 1e-6, 1e-9)
     tolerance_map = dict(zip(types, tol))
     b_regularizer = tf.contrib.layers.l2_regularizer(scale=0.5)
     for dtype in types:
-      inputs = tf.placeholder(dtype, shape=self.mb_in_shape)
+      # With random data, check the TF calculation matches the Numpy version.
+      input_data = np.random.randn(*self.mb_in_shape).astype(
+          dtype.as_numpy_dtype)
+      inputs = tf.constant(input_data)
       add = snt.AddBias(bias_dims=bias_dims,
                         initializers={"b": _test_initializer()},
                         regularizers={"b": b_regularizer})
       output = add(inputs)
-      with self.test_session() as sess:
-        # With random data, check the TF calculation matches the Numpy version.
-        input_data = np.random.randn(*self.mb_in_shape).astype(
-            dtype.as_numpy_dtype)
-        sess.run(tf.global_variables_initializer())
-        output_data, b = sess.run([output, add.b],
-                                  {inputs: input_data})
-        regularizers = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+      output_subtract = add(inputs, multiplier=-1)
+      self.evaluate(tf.global_variables_initializer())
+      output_data, output_subtract_data, b = self.evaluate(
+          [output, output_subtract, add.b])
+      regularizers = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+      if not tf.executing_eagerly():
         self.assertRegexpMatches(regularizers[0].name, ".*l2_regularizer.*")
       if not bias_shape:  # Scalar bias.
-        result = input_data + np.array([b]).astype(dtype.as_numpy_dtype(b))
+        b_array = np.array([b]).astype(dtype.as_numpy_dtype(b))
       else:
-        result = input_data + b.astype(dtype.as_numpy_dtype)
+        b_array = b.astype(dtype.as_numpy_dtype)
+      result = input_data + b_array
+      result_subtract = input_data - b_array
       self.assertAllClose(
           result,
           output_data,
           atol=tolerance_map[dtype],
           rtol=tolerance_map[dtype])
+      self.assertAllClose(
+          result_subtract,
+          output_subtract_data,
+          atol=tolerance_map[dtype],
+          rtol=tolerance_map[dtype])
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testSharing(self, _, bias_dims, unused_bias_shape):
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testSharing(self, bias_dims, unused_bias_shape):
 
     np.random.seed(self.seed)
-    inp_1 = tf.placeholder(tf.float32, shape=self.mb_in_shape)
-    inp_2 = tf.placeholder(tf.float32, shape=self.mb_in_shape)
+    input_data = np.random.randn(*self.mb_in_shape).astype(np.float32)
+    inp_1 = tf.constant(input_data)
+    inp_2 = tf.constant(input_data)
     add = snt.AddBias(bias_dims=bias_dims,
                       initializers={"b": _test_initializer()})
     out_1 = add(inp_1)
     out_2 = add(inp_2)
-    with self.test_session() as sess:
-      # Put the same data into each input, outputs should be identical.
-      input_data = np.random.randn(*self.mb_in_shape)
-      sess.run(tf.global_variables_initializer())
-      out_data_1, out_data_2 = sess.run([out_1, out_2],
-                                        {inp_1: input_data, inp_2: input_data})
+
+    # Put the same data into each input, outputs should be identical.
+    self.evaluate(tf.global_variables_initializer())
+    out_data_1, out_data_2 = self.evaluate([out_1, out_2])
     self.assertAllEqual(out_data_1, out_data_2)
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testUniquifying(self, _, bias_dims, unused_bias_shape):
-
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testUniquifying(self, bias_dims, unused_bias_shape):
     # Create three modules in same scope with same name - make_template will
     # uniquify them.
-    inp = tf.placeholder(tf.float32, shape=self.mb_in_shape)
+    inp = tf.ones(dtype=tf.float32, shape=self.mb_in_shape)
     mod_name = "another_linear_module"
     add1 = snt.AddBias(bias_dims=bias_dims, name=mod_name)
     add2 = snt.AddBias(bias_dims=bias_dims, name=mod_name)
@@ -548,10 +667,8 @@ class AddBiasTest(tf.test.TestCase):
     for v in vars3:
       self.assertRegexpMatches(v.name, r"{}/[b]:0".format(add3.scope_name))
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testInvalidInitializationParameters(self, _, bias_dims,
-                                          unused_bias_shape):
-
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testInvalidInitializationParameters(self, bias_dims, unused_bias_shape):
     err = "Invalid initializer keys.*"
     with self.assertRaisesRegexp(KeyError, err):
       snt.AddBias(
@@ -564,10 +681,8 @@ class AddBiasTest(tf.test.TestCase):
           bias_dims=bias_dims,
           initializers={"b": tf.zeros([1, 2, 3])})
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testInvalidPartitionerParameters(self, _, bias_dims,
-                                       unused_bias_shape):
-
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testInvalidPartitionerParameters(self, bias_dims, unused_bias_shape):
     with self.assertRaisesRegexp(KeyError, "Invalid partitioner keys.*"):
       snt.AddBias(
           bias_dims=bias_dims,
@@ -579,10 +694,8 @@ class AddBiasTest(tf.test.TestCase):
           bias_dims=bias_dims,
           partitioners={"b": tf.zeros([1, 2, 3])})
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testInvalidRegularizationParameters(self, _, bias_dims,
-                                          unused_bias_shape):
-
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testInvalidRegularizationParameters(self, bias_dims, unused_bias_shape):
     with self.assertRaisesRegexp(KeyError, "Invalid regularizer keys.*"):
       snt.AddBias(
           bias_dims=bias_dims,
@@ -593,11 +706,10 @@ class AddBiasTest(tf.test.TestCase):
       snt.AddBias(bias_dims=bias_dims,
                   regularizers={"b": tf.zeros([1, 2, 3])})
 
-  @parameterized.expand(BIAS_DIMS_PARAMETERS)
-  def testTranspose(self, _, bias_dims, unused_bias_shape):
-
+  @parameterized.named_parameters(*BIAS_DIMS_PARAMETERS)
+  def testTranspose(self, bias_dims, unused_bias_shape):
     add = snt.AddBias(bias_dims=bias_dims)
-    input_to_add = tf.placeholder(tf.float32, shape=self.mb_in_shape)
+    input_to_add = tf.ones(dtype=tf.float32, shape=self.mb_in_shape)
 
     # Check error occurs when we build the transposed module before the
     # original.
@@ -616,6 +728,8 @@ class AddBiasTest(tf.test.TestCase):
                      add.b.get_shape())
 
   def testPartitioners(self):
+    if tf.executing_eagerly():
+      self.skipTest("Partitioned variables are not supported in eager mode.")
     inputs = tf.zeros([1, 100])
     partitioners = {
         "b": tf.variable_axis_size_partitioner(10000),
@@ -626,7 +740,8 @@ class AddBiasTest(tf.test.TestCase):
     self.assertEqual(type(bias.b), variables.PartitionedVariable)
 
 
-class TrainableVariableTest(tf.test.TestCase):
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class TrainableVariableTest(tf.test.TestCase, parameterized.TestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -658,15 +773,14 @@ class TrainableVariableTest(tf.test.TestCase):
     lhs_shape = [3, 4]
     rhs_shape = [4, 6]
     for dtype in types:
-      x = tf.placeholder(dtype, shape=lhs_shape)
+      lhs_matrix = np.random.randn(*lhs_shape).astype(dtype.as_numpy_dtype)
+      x = tf.constant(lhs_matrix)
       var = snt.TrainableVariable(shape=rhs_shape,
                                   dtype=dtype,
                                   initializers={"w": _test_initializer()})
       y = tf.matmul(x, var())
-      with self.test_session() as sess:
-        lhs_matrix = np.random.randn(*lhs_shape)
-        sess.run(tf.global_variables_initializer())
-        product, w = sess.run([y, var.w], {x: lhs_matrix})
+      self.evaluate(tf.global_variables_initializer())
+      product, w = self.evaluate([y, var.w])
       self.assertAllClose(product,
                           np.dot(
                               lhs_matrix.astype(dtype.as_numpy_dtype),
@@ -740,9 +854,15 @@ class TrainableVariableTest(tf.test.TestCase):
     var()
 
     regularizers = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-    self.assertRegexpMatches(regularizers[0].name, ".*l1_regularizer.*")
+    if tf.executing_eagerly():
+      # Tensor name is not supported in eager mode.
+      self.assertLen(regularizers, 1)
+    else:
+      self.assertRegexpMatches(regularizers[0].name, ".*l1_regularizer.*")
 
   def testPartitioners(self):
+    if tf.executing_eagerly():
+      self.skipTest("Partitioned variables are not supported in eager mode.")
     partitioners = {
         "w": tf.variable_axis_size_partitioner(10000),
     }
@@ -753,8 +873,40 @@ class TrainableVariableTest(tf.test.TestCase):
 
     self.assertEqual(type(var.w), variables.PartitionedVariable)
 
+  @parameterized.parameters(
+      (True,),
+      (False,))
+  def testCustomGetter(self, with_stop_gradient):
+    if tf.executing_eagerly():
+      self.skipTest("tf.gradients is not supported when executing eagerly.")
 
-class BatchReshapeTest(tf.test.TestCase):
+    def maybe_stop_gradients_custom_getter(getter, *args, **kwargs):
+      actual_variable = getter(*args, **kwargs)
+      if with_stop_gradient:
+        return tf.stop_gradient(actual_variable)
+      else:
+        return actual_variable
+
+    var = snt.TrainableVariable(
+        shape=(), custom_getter=maybe_stop_gradients_custom_getter,
+        name="non_trainable_variable")
+    output = (var() * tf.constant(1.0)) ** 2
+
+    # We need to differentiate with respect to the actual variable object,
+    # rather than var.w which is the output of the custom_getter (and possibly
+    # the stop_gradient).
+    actual_var = var.get_variables()[0]
+    grads = tf.gradients(output, actual_var)
+
+    # Gradient may or mnay not exist depending on the custom getter.
+    if with_stop_gradient:
+      self.assertIsNone(grads[0])
+    else:
+      self.assertIsNotNone(grads[0])
+
+
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class BatchReshapeTest(tf.test.TestCase, parameterized.TestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -768,7 +920,7 @@ class BatchReshapeTest(tf.test.TestCase):
     in_shape = [2, 3, 4, 5]
     out_shape = [2 * 3, 5, 4]
     assert np.prod(in_shape) == np.prod(out_shape)
-    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=[batch_size] + in_shape)
     mod = snt.BatchReshape(shape=out_shape)
     output = mod(inputs)
     self.assertEqual(output.get_shape(), [batch_size] + out_shape)
@@ -776,22 +928,22 @@ class BatchReshapeTest(tf.test.TestCase):
   def testInvalidReshapeParameters(self):
     batch_size = 10
     in_shape = [2, 3, 4, 5]
-    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=[batch_size] + in_shape)
     # Shape array has invalid format
-    err = "Wildcard -1 can appear only once in shape"
+    err = "Wildcard -1 can appear only once in desired output shape. "
     with self.assertRaisesRegexp(ValueError, err):
       output_invalid_shape_format = [-1, -1]
       snt.BatchReshape(shape=output_invalid_shape_format)(inputs)
 
-    err = ("Input array shape can contain positive integral numbers only,"
-           " and the wildcard -1 used once")
+    err = ("Desired shape can only contain positive integral numbers "
+           "and the wildcard -1. ")
     with self.assertRaisesRegexp(ValueError, err):
       output_invalid_shape_format = [2, 3, -2]
       snt.BatchReshape(shape=output_invalid_shape_format)(inputs)
 
     # Shape array contains invalid entries
-    err = ("Input array shape can contain positive integral numbers only,"
-           " and the wildcard -1 used once")
+    err = ("Desired shape can only contain positive integral numbers "
+           "and the wildcard -1. ")
     with self.assertRaisesRegexp(ValueError, err):
       invalid_shape_type = [7, "string"]
       snt.BatchReshape(shape=invalid_shape_type)(inputs)
@@ -807,7 +959,7 @@ class BatchReshapeTest(tf.test.TestCase):
       snt.BatchReshape(shape=[batch_size, 1])(tf.zeros([batch_size, 2]))
 
   def testCallable(self):
-    inputs = tf.placeholder(tf.float32, shape=[2, 3])
+    inputs = tf.ones(dtype=tf.float32, shape=[2, 3])
     out_shape_lambda = lambda: [3]
     mod = snt.BatchReshape(shape=out_shape_lambda)
     output = mod(inputs)
@@ -818,20 +970,85 @@ class BatchReshapeTest(tf.test.TestCase):
     in_shape = [2, 3, 4, 5]
     out_size = [2, -1, 5]
     correct_out_size = [2, 3 * 4, 5]
-    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=[batch_size] + in_shape)
     mod = snt.BatchReshape(shape=out_size)
     output = mod(inputs)
     self.assertEqual(output.get_shape(), [batch_size] + correct_out_size)
 
+  def testAddDimensions(self):
+    batch_size = 10
+    in_shape = []
+    out_size = [1, 1]
+    correct_out_size = [1, 1]
+    inputs = tf.ones(dtype=tf.float32, shape=[batch_size] + in_shape)
+    mod = snt.BatchReshape(shape=out_size)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape(), [batch_size] + correct_out_size)
+    # Transposition should also work
+    mod_t = mod.transpose()
+    t_output = mod_t(output)
+    self.assertEqual(t_output.get_shape(), [batch_size] + in_shape)
+
+  def testNoReshapeNeeded(self):
+    batch_size = 10
+
+    if not tf.executing_eagerly():
+      in_shape = [None]
+      out_size = [-1]
+      inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+      mod = snt.BatchReshape(shape=out_size)
+      output = mod(inputs)
+      self.assertIs(output, inputs)
+
+    in_shape = [10]
+    out_size = [10]
+    inputs = tf.ones(dtype=tf.float32, shape=[batch_size] + in_shape)
+    mod = snt.BatchReshape(shape=out_size)
+    output = mod(inputs)
+    self.assertIs(output, inputs)
+
+  @parameterized.named_parameters(
+      ("BadUnknown1", (None,), (5,)),
+      ("BadUnknown2", (None, None), (5,)),
+      ("BadUnknown3", (None, None), (5, 5)),
+      ("BadUnknown4", (5, None), (5, 5)),
+      ("BadUnknown5", (None, 5), (5, 5)),
+  )
+  def testBadUnknownNonPreservedDimensions(self, input_shape, output_shape):
+    if tf.executing_eagerly():
+      self.skipTest("Partial shapes are not supported in eager mode.")
+    preserved_shape = (10,)
+    shape = preserved_shape + input_shape
+    preserve_dims = len(preserved_shape)
+    inputs = tf.placeholder(tf.float32, shape)
+    mod = snt.BatchReshape(shape=output_shape,
+                           preserve_dims=preserve_dims)
+    err = "Unknown non-preserved dimensions are not allowed"
+    with self.assertRaisesRegexp(ValueError, err):
+      _ = mod(inputs)
+
   def testFlatten(self):
     batch_size = 10
+    in_shape = [2, 3, 4, 5]
+    out_size = [-1]
+    inputs = tf.ones(dtype=tf.float32, shape=[batch_size] + in_shape)
+    mod = snt.BatchReshape(shape=out_size)
+    output = mod(inputs)
+    flattened_shape = np.prod(in_shape)
+    self.assertEqual(output.get_shape(), [batch_size, flattened_shape])
+
+  def testUnknown(self):
+    if tf.executing_eagerly():
+      self.skipTest("Partial shapes are not supported in eager mode.")
+    batch_size = None
     in_shape = [2, 3, 4, 5]
     out_size = [-1]
     inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
     mod = snt.BatchReshape(shape=out_size)
     output = mod(inputs)
     flattened_shape = np.prod(in_shape)
-    self.assertEqual(output.get_shape(), [batch_size, flattened_shape])
+    self.assertEqual(output.get_shape().as_list(),
+                     [batch_size, flattened_shape])
 
   def testTranspose(self):
     batch_size = 10
@@ -850,12 +1067,128 @@ class BatchReshapeTest(tf.test.TestCase):
     further_output = mod_t_t(output)
     self.assertEqual(further_output.get_shape(),
                      [batch_size] + correct_out_size)
+    input_data, out = self.evaluate([inputs, output])
+    self.assertAllClose(out, input_data)
+
+  def testInvalidPreserveDimsError(self):
+    with self.assertRaisesRegexp(ValueError, "preserve_dims"):
+      snt.BatchReshape((-1,), preserve_dims=0)
+
+  def testBuildDimError(self):
+    mod = snt.BatchReshape((-1,), preserve_dims=2)
+    input_tensor = tf.ones(dtype=tf.float32, shape=[50])
+    with self.assertRaisesRegexp(ValueError, "preserve_dims"):
+      mod(input_tensor)
+
+  def testBuildUnknown(self):
+    if tf.executing_eagerly():
+      self.skipTest(
+          "Inputs with unknown shapes are not supported in eager mode.")
+    mod = snt.BatchReshape(shape=(2, 9), preserve_dims=2)
+    shape = [50, None, 6, 3]
+    inputs = tf.placeholder(dtype=tf.float32, shape=shape)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(), [50, None, 2, 9])
+
+  @parameterized.named_parameters(
+      ("Preserve1", (1,)),
+      ("Preserve24", (2, 4)),
+      ("Preserve?", (None,)),
+      ("Preserve?5", (None, 5)),
+      ("Preserve5?", (5, None)),
+      ("Preserve??", (None, None)))
+  def testPreserve(self, preserve):
+    if None in preserve and tf.executing_eagerly():
+      self.skipTest(
+          "Inputs with unknown shapes are not supported in eager mode.")
+    shape = list(preserve) + [13, 84, 3, 2]
+    output_shape = [13, 21, 3, 8]
+    preserve_dims = len(preserve)
+    if None in shape:
+      inputs = tf.placeholder(dtype=tf.float32, shape=shape)
+    else:
+      inputs = tf.ones(dtype=tf.float32, shape=shape)
+    mod = snt.BatchReshape(shape=output_shape,
+                           preserve_dims=preserve_dims)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(),
+                     list(preserve) + output_shape)
+
+  @parameterized.named_parameters(
+      ("Session1", (1,), (2, 3), (-1,)),
+      ("Session2", (1, 7), (2, 3), (-1,)),
+      ("Session3", (None,), (2, 3), (-1,)),
+      ("Session4", (None, 5, None), (2, 3, 4), (4, 6)),
+      ("Session5", (None, None, None), (2, 3, 4), (-1,)),
+      ("Session6", (5, None, None), (1, 3, 1), (-1,)),
+      ("Session7", (1,), (4, 3), (2, 2, 1, 3)),
+      ("Session8", (None,), (4, 3), (2, 2, 1, 3)),
+      ("Session9", (1, None, 5, None), (4, 3), (2, 2, -1, 3)))
+  def testRun(self, preserve, trailing_in, trailing_out):
+    if tf.executing_eagerly():
+      self.skipTest("Inputs with unknown shapes are not supported in eager.")
+    rng = np.random.RandomState(0)
+    input_shape = preserve + trailing_in
+    output_shape = preserve + np.zeros(trailing_in).reshape(trailing_out).shape
+    inputs = tf.placeholder(tf.float32, input_shape)
+    mod = snt.BatchReshape(shape=trailing_out,
+                           preserve_dims=len(preserve))
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(), list(output_shape))
+
+    actual_input_shape = [13 if i is None else i for i in input_shape]
+    expected_output_shape = [13 if i is None else i for i in output_shape]
+    actual_input = rng.rand(*actual_input_shape).astype(np.float32)
+    expected_output = actual_input.reshape(expected_output_shape)
     with self.test_session() as sess:
-      input_data, out = sess.run([inputs, output])
-      self.assertAllClose(out, input_data)
+      actual_output = sess.run(output, feed_dict={inputs: actual_input})
+    self.assertAllEqual(actual_output, expected_output)
 
 
-class BatchFlattenTest(tf.test.TestCase):
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class MergeLeadingDimsTest(tf.test.TestCase, parameterized.TestCase):
+  """Tests the merge_leading_dims function."""
+
+  @parameterized.named_parameters(
+      ("Float", 1.0),
+      ("Integer", 1),
+      ("Boolean", False))
+  def testScalarInput(self, scalar):
+    """Tests if a statically shaped scalar stays a scalar."""
+    # Act.
+    result = basic.merge_leading_dims(scalar)
+
+    # Assert.
+    # This should be the same object we passed in.
+    self.assertIs(result, scalar)
+
+  def testExceptionUnknownRank(self):
+    """Checks if an exception is thrown if the rank of the tensor is unknown."""
+    if tf.executing_eagerly():
+      self.skipTest("Unknown input shapes are not supported in eager mode.")
+    # Arrange.
+    tensor_scalar = tf.placeholder(dtype=tf.float32)
+
+    # Act / assert.
+    err = "unknown rank"
+    with self.assertRaisesRegexp(ValueError, err):
+      basic.merge_leading_dims(tensor_scalar)
+
+  @parameterized.parameters(
+      ([3, 5, 7, 11, None, 13], [3 * 5 * 7, 11, None, 13]),
+      ([3, None, 7, 11, None, 13], [None, 11, None, 13]),
+  )
+  def testPartialShape(self, input_shape, expected_output_shape):
+    """Tests that resulting partial shape is best guess.."""
+    if tf.executing_eagerly():
+      self.skipTest("Partial input shapes are not supported in eager mode.")
+    input_ = tf.placeholder(tf.float32, shape=input_shape)
+    output = basic.merge_leading_dims(input_, 3)
+    self.assertEqual(output.shape.as_list(), expected_output_shape)
+
+
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class BatchFlattenTest(tf.test.TestCase, parameterized.TestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -867,19 +1200,39 @@ class BatchFlattenTest(tf.test.TestCase):
   def testFlatten(self):
     batch_size = 10
     in_shape = [2, 3, 4, 5]
-    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=[batch_size] + in_shape)
     mod = snt.BatchFlatten()
     output = mod(inputs)
     flattened_size = np.prod(in_shape)
     self.assertEqual(output.get_shape(), [batch_size, flattened_size])
 
+  @parameterized.parameters(1, 2, 3, 4)
+  def testPreserveDimsOk(self, preserve_dims):
+    in_shape = [10, 2, 3, 4]
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
+    mod = snt.BatchFlatten(preserve_dims=preserve_dims)
+    output = mod(inputs)
+    flattened_shape = (in_shape[:preserve_dims] +
+                       [np.prod(in_shape[preserve_dims:])])
+    self.assertEqual(output.get_shape(), flattened_shape)
+
+  @parameterized.parameters(5, 6, 7, 10)
+  def testPreserveDimsError(self, preserve_dims):
+    in_shape = [10, 2, 3, 4]
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
+    err = "Input tensor has 4 dimensions"
+    mod = snt.BatchFlatten(preserve_dims=preserve_dims)
+    with self.assertRaisesRegexp(ValueError, err):
+      _ = mod(inputs)
+
   def testFlattenWithZeroDim(self):
-    inputs = tf.placeholder(tf.float32, shape=[1, 0])
+    inputs = tf.ones(dtype=tf.float32, shape=[1, 0])
     output = snt.BatchFlatten()(inputs)
     self.assertEqual(output.get_shape(), [1, 0])
 
 
-class FlattenTrailingDimensionsTest(tf.test.TestCase):
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class FlattenTrailingDimensionsTest(tf.test.TestCase, parameterized.TestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -894,24 +1247,31 @@ class FlattenTrailingDimensionsTest(tf.test.TestCase):
 
   def testBuildDimError(self):
     mod = snt.FlattenTrailingDimensions(dim_from=2)
-    input_tensor = tf.placeholder(tf.float32, (50, 5))
+    input_tensor = tf.ones(dtype=tf.float32, shape=[50])
     with self.assertRaisesRegexp(ValueError, "dim_from"):
       mod(input_tensor)
 
-  def testBuildUnknownError(self):
+  def testBuildUnknown(self):
+    if tf.executing_eagerly():
+      self.skipTest("Partial shapes are not supported in eager mode.")
     mod = snt.FlattenTrailingDimensions(dim_from=2)
-    input_tensor = tf.placeholder(tf.float32, (50, None, 5))
-    with self.assertRaisesRegexp(ValueError, "statically unknown"):
-      mod(input_tensor)
+    shape = [50, None, 5]
+    inputs = tf.placeholder(tf.float32, shape)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(), shape)
 
-  @parameterized.expand([
+  @parameterized.named_parameters(
       ("BatchSize1", 1),
       ("BatchSize5", 5),
-      ("BatchSize?", None)])
-  def testFlatten(self, _, batch_size):
-
+      ("BatchSize?", None))
+  def testFlatten(self, batch_size):
+    if tf.executing_eagerly() and batch_size is None:
+      self.skipTest("Unknown batch size not supported in eager mode.")
     shape = [batch_size, 5, 84, 84, 3, 2]
-    inputs = tf.placeholder(tf.float32, shape)
+    if batch_size is None:
+      inputs = tf.placeholder(dtype=tf.float32, shape=shape)
+    else:
+      inputs = tf.ones(dtype=tf.float32, shape=shape)
     for dim_from in xrange(1, len(shape)):
       mod = snt.FlattenTrailingDimensions(dim_from)
       output = mod(inputs)
@@ -919,23 +1279,28 @@ class FlattenTrailingDimensionsTest(tf.test.TestCase):
       self.assertEqual(output.get_shape().as_list(),
                        shape[:dim_from] + [trailing])
 
-  @parameterized.expand([
+  @parameterized.named_parameters(
       ("BatchSize1", 1),
       ("BatchSize5", 5),
-      ("BatchSize?", None)])
-  def testTranspose(self, _, batch_size):
-
+      ("BatchSize?", None))
+  def testTranspose(self, batch_size):
+    if tf.executing_eagerly() and batch_size is None:
+      self.skipTest("Unknown batch size not supported in eager mode.")
     mod = snt.FlattenTrailingDimensions(dim_from=4)
     mod_trans = mod.transpose()
     initial_shape = [batch_size, 5, 84, 84, 3, 2]
-    original = tf.placeholder(tf.float32, initial_shape)
+    if batch_size is None:
+      original = tf.placeholder(dtype=tf.float32, shape=initial_shape)
+    else:
+      original = tf.ones(dtype=tf.float32, shape=initial_shape)
     flat = mod(original)
     self.assertEqual(flat.get_shape().as_list(), initial_shape[:4] + [6])
     final = mod_trans(flat)
     self.assertEqual(final.get_shape().as_list(), initial_shape)
 
 
-class BatchApplyTest(tf.test.TestCase):
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class BatchApplyTest(tf.test.TestCase, parameterized.TestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -944,17 +1309,19 @@ class BatchApplyTest(tf.test.TestCase):
     self.assertEqual(mod.scope_name, "scope/" + mod_name)
     self.assertEqual(mod.module_name, mod_name)
 
-  @parameterized.expand([(False,), (True,)])
+  @parameterized.parameters(False, True)
   def testInferShape(self, test_with_none):
-
+    if tf.executing_eagerly() and test_with_none:
+      self.skipTest("Inferring input shapes not supported in eager mode.")
     if test_with_none:
       in_shape = [2, None, 4]
+      inputs = tf.placeholder(dtype=tf.float32, shape=in_shape)
     else:
       in_shape = [2, 3, 4]
+      inputs = tf.ones(dtype=tf.float32, shape=in_shape)
     hidden_size = 5
     out_shape1 = in_shape[:2] + [hidden_size]
     out_shape2 = in_shape
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
     linear = snt.Linear(hidden_size)
     merge_linear = snt.BatchApply(module_or_op=linear)
     outputs1 = merge_linear(inputs)
@@ -981,17 +1348,16 @@ class BatchApplyTest(tf.test.TestCase):
     merge_tanh = snt.BatchApply(module_or_op=tf.tanh)
     outputs2 = merge_tanh(inputs)
     outputs2_flat = merge_tanh(inputs_flat)
-    with self.test_session() as sess:
-      sess.run(tf.global_variables_initializer())
-      out1, out_flat1 = sess.run([outputs1, outputs1_flat])
-      out2, out_flat2 = sess.run([outputs2, outputs2_flat])
-      self.assertAllClose(out1, out_flat1.reshape(out_shape1))
-      self.assertAllClose(out2, out_flat2.reshape(out_shape2))
+    self.evaluate(tf.global_variables_initializer())
+    out1, out_flat1 = self.evaluate([outputs1, outputs1_flat])
+    out2, out_flat2 = self.evaluate([outputs2, outputs2_flat])
+    self.assertAllClose(out1, out_flat1.reshape(out_shape1))
+    self.assertAllClose(out2, out_flat2.reshape(out_shape2))
 
   def testVariables(self):
     hidden_size = 5
     in_shape = [2, 3, 4]
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
     linear = snt.Linear(hidden_size)
     merge_linear = snt.BatchApply(module_or_op=linear)
     merge_tanh = snt.BatchApply(module_or_op=tf.tanh)
@@ -1006,15 +1372,14 @@ class BatchApplyTest(tf.test.TestCase):
     hidden_size = 42
     in_shape = (3, 4, 5, 6)
     expected_out_shape = in_shape[:-1] + (hidden_size,)
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
     linear = snt.Linear(output_size=hidden_size)
     merge_linear = snt.BatchApply(module_or_op=linear, n_dims=3)
     output = merge_linear(inputs)
 
-    with self.test_session() as sess:
-      sess.run(tf.global_variables_initializer())
-      out_np = sess.run(output, {inputs: np.random.randn(*in_shape)})
-      self.assertEqual(expected_out_shape, out_np.shape)
+    self.evaluate(tf.global_variables_initializer())
+    out_np = self.evaluate(output)
+    self.assertEqual(expected_out_shape, out_np.shape)
 
   def testDifferentOutputStructure(self):
     in1 = np.random.randn(3, 5, 7)
@@ -1030,23 +1395,23 @@ class BatchApplyTest(tf.test.TestCase):
     module = snt.BatchApply(op)
     output = module(inputs)
 
-    with self.test_session() as sess:
-      out_np = sess.run(output)
-      self.assertAllEqual(in2, out_np)
+    out_np = self.evaluate(output)
+    self.assertAllEqual(in2, out_np)
 
   def testNested(self):
     # Make a complicated nested input, where we want to flatten the first
     # dimensions of each Tensor before applying
     ab_tuple = collections.namedtuple("ab_tuple", "a, b")
-    ab = ab_tuple(a=tf.placeholder(tf.float32, shape=[3, 4, 5]),
-                  b=(tf.placeholder(tf.float32, shape=[3, 4, 7]),
-                     tf.placeholder(tf.float32, shape=[3, 4, 8])))
+    ab = ab_tuple(
+        a=tf.ones(dtype=tf.float32, shape=[3, 4, 5]),
+        b=(tf.ones(dtype=tf.float32, shape=[3, 4, 7]),
+           tf.ones(dtype=tf.float32, shape=[3, 4, 8])))
 
     class SizeChecker(snt.AbstractModule):
       """Dummy module checking input is correct structure & size."""
 
       def __init__(self, tester, name="size_checker"):
-        super(SizeChecker, self).__init__(name)
+        super(SizeChecker, self).__init__(name=name)
         self._tester = tester
 
       def _build(self, inputs):
@@ -1081,17 +1446,101 @@ class BatchApplyTest(tf.test.TestCase):
 
     # Checks an error is thrown when the input example contains a different
     # shape for the leading dimensions as the output.
-    with self.assertRaises(ValueError):
+    exc = tf.errors.InvalidArgumentError if tf.executing_eagerly() else (
+        ValueError)
+    with self.assertRaises(exc):
       snt.BatchApply(op, n_dims=2, input_example_index=0)((in1, in2))
 
     # Check correct operation when the specified input example contains the same
     # shape for the leading dimensions as the output.
     output = snt.BatchApply(op, n_dims=2, input_example_index=1)((in1, in2))
-    with self.test_session() as sess:
-      in2_np, out_np = sess.run([in2, output])
-      self.assertAllEqual(in2_np, out_np)
+    in2_np, out_np = self.evaluate([in2, output])
+    self.assertAllEqual(in2_np, out_np)
+
+  def testMultipleArgs(self):
+    in1 = np.random.randn(2, 3, 4, 5)
+    in2 = np.random.randn(2, 3, 5, 8)
+
+    module = snt.BatchApply(tf.matmul)
+    output = module(in1, in2)
+    output.get_shape().assert_is_compatible_with([2, 3, 4, 8])
+
+    expected_output = tf.matmul(in1, in2)
+    out_expected, out_result = self.evaluate([expected_output, output])
+    self.assertAllClose(out_expected, out_result)
+
+  def testKWArgs(self):
+    in1 = np.random.randn(2, 3, 4, 5)
+    in2 = np.random.randn(2, 3, 5, 8)
+
+    module = snt.BatchApply(tf.matmul)
+    output = module(a=in1, b=in2)
+    output.get_shape().assert_is_compatible_with([2, 3, 4, 8])
+
+    expected_output = tf.matmul(in1, in2)
+    out_expected, out_result = self.evaluate([expected_output, output])
+    self.assertAllClose(out_expected, out_result)
+
+  def testHandlesReturnedNone(self):
+    def fn(input_):
+      del input_
+      return None
+    result = snt.BatchApply(fn)(tf.zeros([1, 1]))
+    self.assertEqual(result, None)
+
+  def testSomeInputsAreNone(self):
+    in1 = np.random.randn(2, 3, 4, 5)
+    in2 = np.random.randn(2, 3, 5, 8)
+    in3 = None
+
+    def build(input1, input2, input3):
+      output = tf.matmul(input1, input2)
+      if input3 is not None:
+        output = tf.matmul(input3)
+      return output
+
+    module = snt.BatchApply(build)
+    output = module(in1, in2, in3)
+    output.get_shape().assert_is_compatible_with([2, 3, 4, 8])
+
+    expected_output = tf.matmul(in1, in2)
+    out_expected, out_result = self.evaluate([expected_output, output])
+    self.assertAllClose(out_expected, out_result)
+
+  @parameterized.named_parameters(
+      ("flagArgTrue", [True], {}),
+      ("flagArgFalse", [False], {}),
+      ("flagKwargTrue", [], {"is_training": True}),
+      ("flagKwargFalse", [], {"is_training": False}))
+  def testNonTensor(self, flag_args, flag_kawargs):
+    """Tests if non-tensor inputs are simply forwarded to the module."""
+    # Arrange.
+    # We work around the Python closure issue by writing to a list instead of
+    # a primitive variable.
+    received_flag_value = [None]
+    x = tf.ones(shape=(5, 3, 10), dtype=tf.float32)
+
+    def _build(inputs, is_training):
+      """Builds a network that requires a flag at construction time."""
+      net = snt.Linear(output_size=10)(inputs)
+      net = snt.BatchNorm()(net, is_training=is_training)
+      # We record the value of the flag here to make sure that the value
+      # is correctly passed on to this module.
+      received_flag_value[0] = is_training
+      return net
+
+    # Act.
+    snt.BatchApply(snt.Module(build=_build))(x, *flag_args, **flag_kawargs)
+
+    # Assert.
+    self.assertIsNotNone(received_flag_value[0])
+
+    # Recover the flag value from the test inputs.
+    flag_value = nest.flatten_iterable([flag_args, flag_kawargs])[0]
+    self.assertEqual(received_flag_value[0], flag_value)
 
 
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
 class SliceByDimTest(tf.test.TestCase):
 
   def testName(self):
@@ -1108,7 +1557,7 @@ class SliceByDimTest(tf.test.TestCase):
     begin = [0, 1, 2]
     size = [1, 2, 3]
     out_shape = [1, 3, 2, 5, 3]
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
     mod = snt.SliceByDim(dims=dims, begin=begin, size=size)
     output = mod(inputs)
     self.assertEqual(output.get_shape(), out_shape)
@@ -1128,9 +1577,8 @@ class SliceByDimTest(tf.test.TestCase):
     size_tf = [1, -1, 2]
     ref_output = tf.slice(inputs, begin=begin_tf, size=size_tf)
 
-    with self.test_session() as sess:
-      actual, expected = sess.run([output, ref_output])
-      self.assertAllEqual(actual, expected)
+    actual, expected = self.evaluate([output, ref_output])
+    self.assertAllEqual(actual, expected)
 
   def testComputation(self):
     inputs = tf.constant(dtype=tf.int32, value=[[1, 2, 3], [1, 2, 3]])
@@ -1141,10 +1589,9 @@ class SliceByDimTest(tf.test.TestCase):
     mod = snt.SliceByDim(dims=dims, begin=begin, size=size)
     output = mod(inputs)
 
-    with self.test_session() as sess:
-      actual = sess.run(output)
-      expected = [[2, 3]]
-      self.assertAllEqual(actual, expected)
+    actual = self.evaluate(output)
+    expected = [[2, 3]]
+    self.assertAllEqual(actual, expected)
 
   def testNegativeDim(self):
     inputs = tf.constant(dtype=tf.int32, value=[[1, 2, 3], [4, 5, 6]])
@@ -1155,10 +1602,9 @@ class SliceByDimTest(tf.test.TestCase):
     mod = snt.SliceByDim(dims=dims, begin=begin, size=size)
     output = mod(inputs)
 
-    with self.test_session() as sess:
-      actual = sess.run(output)
-      expected = [[2, 3], [5, 6]]
-      self.assertAllEqual(actual, expected)
+    actual = self.evaluate(output)
+    expected = [[2, 3], [5, 6]]
+    self.assertAllEqual(actual, expected)
 
   def testInvalidSliceParameters(self):
     dims = [0, 2, 4]
@@ -1184,7 +1630,7 @@ class SliceByDimTest(tf.test.TestCase):
     mod = snt.SliceByDim(dims=dims, begin=begin, size=size)
 
     in_shape = [2, 3, 4, 5]
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
 
     err = "Rank of inputs must be at least {}.".format(np.max(dims) + 1)
     with self.assertRaisesRegexp(ValueError, err):
@@ -1200,6 +1646,7 @@ class SliceByDimTest(tf.test.TestCase):
       _ = snt.SliceByDim(dims=dims, begin=begin, size=size)
 
 
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
 class TileByDimTest(tf.test.TestCase):
 
   def testName(self):
@@ -1214,7 +1661,7 @@ class TileByDimTest(tf.test.TestCase):
     dims = [0, 2, 4]
     multiples = [1, 2, 3]
     out_shape = [2, 3, 8, 5, 18]
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
     mod = snt.TileByDim(dims=dims, multiples=multiples)
     output = mod(inputs)
     self.assertEqual(output.get_shape(), out_shape)
@@ -1232,9 +1679,8 @@ class TileByDimTest(tf.test.TestCase):
     multiple_tf = [2, 1, 4]
     ref_output = tf.tile(inputs, multiples=multiple_tf)
 
-    with self.test_session() as sess:
-      actual, expected = sess.run([output, ref_output])
-      self.assertAllEqual(actual, expected)
+    actual, expected = self.evaluate([output, ref_output])
+    self.assertAllEqual(actual, expected)
 
   def testComputation(self):
     inputs = tf.constant(dtype=tf.int32, value=[[1, 2, 3], [1, 2, 3]])
@@ -1244,10 +1690,9 @@ class TileByDimTest(tf.test.TestCase):
     mod = snt.TileByDim(dims=dims, multiples=multiples)
     output = mod(inputs)
 
-    with self.test_session() as sess:
-      actual = sess.run(output)
-      expected = [[1, 2, 3, 1, 2, 3], [1, 2, 3, 1, 2, 3]]
-      self.assertAllEqual(actual, expected)
+    actual = self.evaluate(output)
+    expected = [[1, 2, 3, 1, 2, 3], [1, 2, 3, 1, 2, 3]]
+    self.assertAllEqual(actual, expected)
 
   def testInvalidTileParameters(self):
     dims = [0, 2, 4]
@@ -1266,7 +1711,8 @@ class TileByDimTest(tf.test.TestCase):
       snt.TileByDim(dims=dims, multiples=multiples)
 
 
-class MergeDimsTest(tf.test.TestCase):
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
+class MergeDimsTest(tf.test.TestCase, parameterized.TestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -1280,10 +1726,54 @@ class MergeDimsTest(tf.test.TestCase):
     start = 1
     size = 3
     out_shape = [2, 3 * 4 * 5, 6]
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
     mod = snt.MergeDims(start=start, size=size)
     output = mod(inputs)
     self.assertEqual(output.get_shape(), out_shape)
+
+  def testInferShape_negStart(self):
+    in_shape = [2, 3, 4, 5, 6]
+    start = -4
+    size = 3
+    out_shape = [2, 3 * 4 * 5, 6]
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
+    mod = snt.MergeDims(start=start, size=size)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape(), out_shape)
+
+  @parameterized.parameters(
+      ([2, None, 4, 5, 6],),
+      ([None, None, 4, 5, 6],),
+      ([2, 3, None, 5, 6],),
+      ([2, None, None, None, 6],))
+  def testWithUndefinedDims(self, in_shape):
+    if tf.executing_eagerly():
+      self.skipTest("Inputs with partial unknown are not supported in eager.")
+    start = 2
+    size = 2
+    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    mod = snt.MergeDims(start=start, size=size)
+    output = mod(inputs)
+    static_shape = in_shape
+    static_shape[2:4] = [None] if None in in_shape[2:4] else [4 * 5]
+    self.assertEqual(output.get_shape().as_list(), static_shape)
+    with self.test_session():
+      output = output.eval(feed_dict={inputs: np.zeros([2, 3, 4, 5, 6])})
+      self.assertEqual(list(output.shape), [2, 3, 4 * 5, 6])
+
+  def testWithUndefinedAndZeroDim(self):
+    if tf.executing_eagerly():
+      self.skipTest("Unspecified input shapes are not supported in eager mode.")
+    in_shape = [0, None, 2, 3]
+    start = 1
+    size = 2
+    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    mod = snt.MergeDims(start=start, size=size)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(), [0, None, 3])
+    with self.test_session() as session:
+      output = session.run(output, feed_dict={inputs: np.zeros([0, 5, 2, 3])})
+    self.assertEqual(list(output.shape), [0, 10, 3])
 
   def testComputation(self):
     # Here we compare the output with the tf.reshape equivalent.
@@ -1297,9 +1787,8 @@ class MergeDimsTest(tf.test.TestCase):
 
     ref_output = tf.reshape(inputs, shape=[2, 3 * 4, 5, 6])
 
-    with self.test_session() as sess:
-      out = sess.run([output, ref_output])
-      self.assertAllEqual(out[0], out[1])
+    out = self.evaluate([output, ref_output])
+    self.assertAllEqual(out[0], out[1])
 
   def testInvalidDimsParameters(self):
     start = 3
@@ -1315,7 +1804,7 @@ class MergeDimsTest(tf.test.TestCase):
     mod = snt.MergeDims(start=start, size=size)
 
     in_shape = [2, 3, 4]
-    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    inputs = tf.ones(dtype=tf.float32, shape=in_shape)
 
     err = "Rank of inputs must be at least {}.".format(start + size)
     with self.assertRaisesRegexp(ValueError, err):
@@ -1357,6 +1846,7 @@ class MergeDimsTest(tf.test.TestCase):
                        merged_shape.num_elements())
 
 
+# @tf.contrib.eager.run_all_tests_in_graph_and_eager_modes
 class SelectInputTest(tf.test.TestCase):
 
   def testName(self):
@@ -1377,9 +1867,8 @@ class SelectInputTest(tf.test.TestCase):
     output = mod(input0, input1)
     output0 = tf.identity(input0)
 
-    with self.test_session() as sess:
-      out = sess.run([output, output0])
-      self.assertAllEqual(out[0], out[1])
+    out = self.evaluate([output, output0])
+    self.assertAllEqual(out[0], out[1])
 
   def testTupleSelect(self):
     """Test where idx is a tuple."""
@@ -1395,10 +1884,9 @@ class SelectInputTest(tf.test.TestCase):
     output0 = tf.identity(input0)
     output2 = tf.identity(input2)
 
-    with self.test_session() as sess:
-      out = sess.run([output, [output0, output2]])
-      self.assertAllEqual(out[0][0], out[1][0])
-      self.assertAllEqual(out[0][1], out[1][1])
+    out = self.evaluate([output, [output0, output2]])
+    self.assertAllEqual(out[0][0], out[1][0])
+    self.assertAllEqual(out[0][1], out[1][1])
 
   def testNestedListSelect(self):
     """Test where idx is a nested list."""
@@ -1415,17 +1903,16 @@ class SelectInputTest(tf.test.TestCase):
     output1 = tf.identity(input1)
     output2 = tf.identity(input2)
 
-    with self.test_session() as sess:
-      out = sess.run([output, [output2, [output1, output0, output1]]])
-      self.assertAllEqual(out[0][0], out[1][0])
-      self.assertAllEqual(out[0][1][0], out[1][1][0])
-      self.assertAllEqual(out[0][1][1], out[1][1][1])
-      self.assertAllEqual(out[0][1][2], out[1][1][2])
+    out = self.evaluate([output, [output2, [output1, output0, output1]]])
+    self.assertAllEqual(out[0][0], out[1][0])
+    self.assertAllEqual(out[0][1][0], out[1][1][0])
+    self.assertAllEqual(out[0][1][1], out[1][1][1])
+    self.assertAllEqual(out[0][1][2], out[1][1][2])
 
   def testInvalidIdxValue(self):
     """Checks error on invalid idx value."""
-    input1 = tf.placeholder(tf.float32, shape=[2, 3, 4, 5, 6])
-    input2 = tf.placeholder(tf.float32, shape=[7, 8])
+    input1 = tf.ones(dtype=tf.float32, shape=[2, 3, 4, 5, 6])
+    input2 = tf.ones(dtype=tf.float32, shape=[7, 8])
 
     invalid_idx = 2
     mod = snt.SelectInput(idx=[invalid_idx])
